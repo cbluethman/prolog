@@ -10,7 +10,7 @@ namespace InventoryAggregation.Tests;
 public class RetryHandlerTests
 {
     private readonly ScriptedHttpHandler _network = new();
-    private readonly List<TimeSpan> _waits = [];
+    private readonly RecordingDelay _recorder = new();
     private readonly InventoryApiOptions _options = new()
     {
         MaxAttempts = 4,
@@ -18,6 +18,8 @@ public class RetryHandlerTests
         MaxRetryDelay = TimeSpan.FromSeconds(30),
         AttemptTimeout = TimeSpan.FromSeconds(5),
     };
+
+    private List<TimeSpan> Waits => _recorder.Waits;
 
     private TimeProvider _clock = TimeProvider.System;
 
@@ -27,14 +29,8 @@ public class RetryHandlerTests
     /// <summary>The handler under test, wired to the fake network, recording waits instead of sleeping.</summary>
     private HttpMessageInvoker CreateInvoker()
     {
-        RetryDelay recordOnly = (wait, _) =>
-        {
-            _waits.Add(wait);
-            return Task.CompletedTask;
-        };
-
         var handler = new RetryHandler(
-            Options.Create(_options), _delay ?? recordOnly, _clock, NullLogger<RetryHandler>.Instance)
+            Options.Create(_options), _delay ?? _recorder.Record, _clock, NullLogger<RetryHandler>.Instance)
         {
             InnerHandler = _network,
         };
@@ -69,7 +65,7 @@ public class RetryHandlerTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Theory]
@@ -87,7 +83,7 @@ public class RetryHandlerTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(3, _network.RequestCount);
-        Assert.Equal(2, _waits.Count);
+        Assert.Equal(2, Waits.Count);
     }
 
     [Theory]
@@ -103,7 +99,7 @@ public class RetryHandlerTests
 
         Assert.Equal(permanent, response.StatusCode);
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -119,7 +115,7 @@ public class RetryHandlerTests
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal(4, _network.RequestCount);
-        Assert.Equal(3, _waits.Count);
+        Assert.Equal(3, Waits.Count);
     }
 
     [Fact]
@@ -129,7 +125,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        var wait = Assert.Single(_waits);
+        var wait = Assert.Single(Waits);
         Assert.InRange(wait, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10.5));
     }
 
@@ -158,8 +154,8 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.Equal(59, _waits.Count);
-        Assert.Equal(_options.MaxRetryDelay, _waits.Max());
+        Assert.Equal(59, Waits.Count);
+        Assert.Equal(_options.MaxRetryDelay, Waits.Max());
     }
 
     [Fact]
@@ -180,7 +176,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.Equal(_options.MaxRetryDelay, Assert.Single(_waits));
+        Assert.Equal(_options.MaxRetryDelay, Assert.Single(Waits));
     }
 
     [Fact]
@@ -195,10 +191,10 @@ public class RetryHandlerTests
         await SendAsync();
 
         // Base 100 ms doubling each time, plus up to 50 ms of jitter.
-        Assert.Equal(3, _waits.Count);
-        Assert.InRange(_waits[0], TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
-        Assert.InRange(_waits[1], TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(250));
-        Assert.InRange(_waits[2], TimeSpan.FromMilliseconds(400), TimeSpan.FromMilliseconds(450));
+        Assert.Equal(3, Waits.Count);
+        Assert.InRange(Waits[0], TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
+        Assert.InRange(Waits[1], TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(250));
+        Assert.InRange(Waits[2], TimeSpan.FromMilliseconds(400), TimeSpan.FromMilliseconds(450));
     }
 
     [Fact]
@@ -260,7 +256,7 @@ public class RetryHandlerTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -273,7 +269,7 @@ public class RetryHandlerTests
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -285,7 +281,7 @@ public class RetryHandlerTests
         await Assert.ThrowsAsync<HttpRequestException>(() => SendAsync());
 
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -298,7 +294,7 @@ public class RetryHandlerTests
         await Assert.ThrowsAsync<TimeoutException>(() => SendAsync());
 
         Assert.Equal(1, _network.RequestCount);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -308,7 +304,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.Equal(TimeSpan.FromMilliseconds(250), Assert.Single(_waits));
+        Assert.Equal(TimeSpan.FromMilliseconds(250), Assert.Single(Waits));
     }
 
     [Fact]
@@ -322,7 +318,7 @@ public class RetryHandlerTests
         await SendAsync();
 
         // Never a negative wait, and never the general backoff either.
-        Assert.Equal(TimeSpan.FromMilliseconds(250), Assert.Single(_waits));
+        Assert.Equal(TimeSpan.FromMilliseconds(250), Assert.Single(Waits));
     }
 
     [Fact]
@@ -336,7 +332,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.Equal(TimeSpan.FromSeconds(20.25), Assert.Single(_waits));
+        Assert.Equal(TimeSpan.FromSeconds(20.25), Assert.Single(Waits));
     }
 
     [Theory]
@@ -348,7 +344,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.InRange(Assert.Single(_waits), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
+        Assert.InRange(Assert.Single(Waits), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
     }
 
     [Fact]
@@ -364,9 +360,9 @@ public class RetryHandlerTests
         await SendAsync();
 
         // Uncapped, the second and third waits would be at least 200 ms and 400 ms.
-        Assert.Equal(3, _waits.Count);
-        Assert.Equal(TimeSpan.FromMilliseconds(150), _waits[1]);
-        Assert.Equal(TimeSpan.FromMilliseconds(150), _waits[2]);
+        Assert.Equal(3, Waits.Count);
+        Assert.Equal(TimeSpan.FromMilliseconds(150), Waits[1]);
+        Assert.Equal(TimeSpan.FromMilliseconds(150), Waits[2]);
     }
 
     [Fact]
@@ -377,7 +373,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.InRange(Assert.Single(_waits), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
+        Assert.InRange(Assert.Single(Waits), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150));
     }
 
     [Fact]
@@ -410,7 +406,7 @@ public class RetryHandlerTests
 
         Assert.Equal("complete", await response.Content.ReadAsStringAsync());
         Assert.Equal(2, _network.RequestCount);
-        Assert.Single(_waits);
+        Assert.Single(Waits);
     }
 
     [Fact]
@@ -464,7 +460,7 @@ public class RetryHandlerTests
         }
 
         Assert.Empty(retried);
-        Assert.Empty(_waits);
+        Assert.Empty(Waits);
     }
 
     [Fact]
@@ -477,10 +473,10 @@ public class RetryHandlerTests
             await SendAsync();
         }
 
-        Assert.Equal(40, _waits.Count);
-        Assert.All(_waits, wait => Assert.InRange(wait, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150)));
+        Assert.Equal(40, Waits.Count);
+        Assert.All(Waits, wait => Assert.InRange(wait, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150)));
         // Forty random draws from a 50 ms range landing within 5 ms of each other would be about 1 in 10^38.
-        Assert.True(_waits.Max() - _waits.Min() > TimeSpan.FromMilliseconds(5), "every retry waited the same time");
+        Assert.True(Waits.Max() - Waits.Min() > TimeSpan.FromMilliseconds(5), "every retry waited the same time");
     }
 
     [Fact]
@@ -491,7 +487,7 @@ public class RetryHandlerTests
 
         await SendAsync();
 
-        Assert.Equal([TimeSpan.Zero, TimeSpan.Zero], _waits);
+        Assert.Equal([TimeSpan.Zero, TimeSpan.Zero], Waits);
     }
 
     [Fact]

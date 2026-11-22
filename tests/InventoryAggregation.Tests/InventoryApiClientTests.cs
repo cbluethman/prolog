@@ -27,8 +27,10 @@ public class InventoryApiClientTests
         """;
 
     private readonly ScriptedHttpHandler _network = new();
-    private readonly List<TimeSpan> _waits = [];
+    private readonly RecordingDelay _recorder = new();
     private readonly ManualTimeProvider _clock = new();
+
+    private List<TimeSpan> Waits => _recorder.Waits;
 
     private IInventoryApiClient CreateClient(Dictionary<string, string?>? settings = null) =>
         BuildProvider(settings).GetRequiredService<IInventoryApiClient>();
@@ -36,23 +38,14 @@ public class InventoryApiClientTests
     private ServiceProvider BuildProvider(Dictionary<string, string?>? settings = null)
     {
         var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                ["InventoryApi:BaseUrl"] = "https://inventory.test",
-                ["InventoryApi:ApiKey"] = "test-key",
-                ["InventoryApi:MaxAttempts"] = "3",
-            })
+            .AddInMemoryCollection(TestSettings.With(new Dictionary<string, string?> { ["InventoryApi:MaxAttempts"] = "3" }))
             .AddInMemoryCollection(settings ?? [])
             .Build();
 
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<IConfiguration>(configuration);
-        services.AddSingleton<RetryDelay>((wait, _) =>
-        {
-            _waits.Add(wait);
-            return Task.CompletedTask;
-        });
+        services.AddSingleton<RetryDelay>(_recorder.Record);
         services.AddSingleton<TimeProvider>(_clock);
         services.AddInventoryApiClient();
         services.AddHttpClient(InventoryApiClient.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => _network);
@@ -106,7 +99,7 @@ public class InventoryApiClientTests
 
         Assert.Equal(157, page.TotalRecords);
         Assert.Equal(3, _network.RequestCount);
-        Assert.Equal(2, _waits.Count);
+        Assert.Equal(2, Waits.Count);
     }
 
     [Fact]
@@ -271,9 +264,9 @@ public class InventoryApiClientTests
         Assert.Contains(key, exception.Message);
     }
 
-    // Each of these passes validation today and then breaks every request instead: the two timeouts
-    // cannot be scheduled (ArgumentOutOfRangeException, reported as a 502 or a 500), and the TTL
-    // cannot be added to the current time, so a crawl that succeeded still ends in a 500.
+    // Without an upper bound each of these would start cleanly and then break every request: a timeout
+    // this long cannot be scheduled (ArgumentOutOfRangeException), and a TTL this long cannot be added
+    // to the current time.
     [Theory]
     [InlineData("InventoryApi:AttemptTimeout", "50.00:00:00")]
     [InlineData("InventoryApi:CrawlTimeout", "50.00:00:00")]
@@ -344,13 +337,8 @@ public class InventoryApiClientTests
         // The other tests replace the network handler, so inspect the one production would use.
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddSingleton<IConfiguration>(new ConfigurationBuilder()
-            .AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                ["InventoryApi:BaseUrl"] = "https://inventory.test",
-                ["InventoryApi:ApiKey"] = "test-key",
-            })
-            .Build());
+        services.AddSingleton<IConfiguration>(
+            new ConfigurationBuilder().AddInMemoryCollection(TestSettings.With()).Build());
         services.AddInventoryApiClient();
         using var provider = services.BuildServiceProvider();
 
@@ -498,6 +486,75 @@ public class InventoryApiClientTests
         var exception = await AssertFailsAsync(InventoryFailureReason.RateLimited);
 
         Assert.Equal(TimeSpan.Zero, exception.RetryAfter);
+    }
+
+    [Fact]
+    public async Task Rate_limit_with_a_retry_after_of_zero_reports_no_wait_rather_than_none()
+    {
+        _network
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: "0")
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: "0")
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: "0");
+
+        var exception = await AssertFailsAsync(InventoryFailureReason.RateLimited);
+
+        Assert.Equal(TimeSpan.Zero, exception.RetryAfter);
+    }
+
+    [Theory]
+    [InlineData("soon")]
+    [InlineData("-5")]
+    public async Task Rate_limit_with_an_unreadable_retry_after_reports_none(string retryAfter)
+    {
+        _network
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: retryAfter)
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: retryAfter)
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: retryAfter);
+
+        var exception = await AssertFailsAsync(InventoryFailureReason.RateLimited);
+
+        Assert.Null(exception.RetryAfter);
+    }
+
+    [Fact]
+    public async Task Retry_after_date_means_the_same_time_left_to_the_waits_and_to_the_reported_failure()
+    {
+        // Years away from the real clock: the retry handler and the client must both read the injected one.
+        _clock.Now = new DateTimeOffset(2031, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var comeBackAt = _clock.Now.AddSeconds(20).ToString("R");
+        _network
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: comeBackAt)
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: comeBackAt)
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: comeBackAt);
+
+        var exception = await AssertFailsAsync(InventoryFailureReason.RateLimited);
+
+        // Each wait is the server's 20 seconds plus the handler's quarter-second safety padding.
+        Assert.Equal([TimeSpan.FromSeconds(20.25), TimeSpan.FromSeconds(20.25)], Waits);
+        Assert.Equal(TimeSpan.FromSeconds(20), exception.RetryAfter);
+    }
+
+    [Theory]
+    [InlineData("<html>Service temporarily unavailable</html>")]
+    [InlineData("""{ "records": [], "page": 1, "totalPages": 1, "totalRecords": 0""")]
+    [InlineData("""{ "records": [], "page": "one", "totalPages": 1, "totalRecords": 0 }""")]
+    public async Task Body_that_is_not_the_expected_json_keeps_the_parser_error_as_the_cause(string body)
+    {
+        _network.Respond(HttpStatusCode.OK, body);
+
+        var exception = await AssertFailsAsync(InventoryFailureReason.InvalidData);
+
+        Assert.IsType<System.Text.Json.JsonException>(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task Body_that_is_json_but_incomplete_has_no_underlying_cause()
+    {
+        _network.Respond(HttpStatusCode.OK, """{ "records": [], "page": 1, "totalPages": 1 }""");
+
+        var exception = await AssertFailsAsync(InventoryFailureReason.InvalidData);
+
+        Assert.Null(exception.InnerException);
     }
 
     [Fact]

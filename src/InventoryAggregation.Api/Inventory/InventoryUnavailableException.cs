@@ -35,4 +35,8 @@ public sealed class InventoryUnavailableException(
 
     /// <summary>The server's Retry-After, when it sent one.</summary>
     public TimeSpan? RetryAfter { get; } = retryAfter;
+
+    /// <summary>A success response that cannot be trusted: malformed, incomplete or inconsistent.</summary>
+    public static InventoryUnavailableException InvalidData(string message, Exception? innerException = null) =>
+        new(InventoryFailureReason.InvalidData, message, innerException);
 }

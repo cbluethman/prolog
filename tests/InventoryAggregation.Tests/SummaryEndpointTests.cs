@@ -23,16 +23,10 @@ public class SummaryEndpointTests : IDisposable
 
     public SummaryEndpointTests()
     {
-        _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(host =>
+        _factory = TestApp.Create(services =>
         {
-            host.UseEnvironment("Testing");
-            host.UseSetting("InventoryApi:BaseUrl", "https://inventory.test");
-            host.UseSetting("InventoryApi:ApiKey", "test-key");
-            host.ConfigureTestServices(services =>
-            {
-                services.RemoveAll<IInventoryApiClient>();
-                services.AddSingleton<IInventoryApiClient>(_upstream);
-            });
+            services.RemoveAll<IInventoryApiClient>();
+            services.AddSingleton<IInventoryApiClient>(_upstream);
         });
     }
 
@@ -41,7 +35,7 @@ public class SummaryEndpointTests : IDisposable
     private async Task<(HttpResponseMessage Response, JsonElement Json)> GetSummaryAsync()
     {
         var response = await _factory.CreateClient().GetAsync(InventoryEndpoints.SummaryRoute);
-        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        var json = await response.ReadJsonAsync();
         return (response, json);
     }
 
@@ -291,7 +285,7 @@ public class SummaryEndpointTests : IDisposable
     public async Task Unknown_route_is_a_404_problem_response()
     {
         var response = await _factory.CreateClient().GetAsync("/api/inventory/nothing-here");
-        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        var json = await response.ReadJsonAsync();
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
@@ -303,7 +297,7 @@ public class SummaryEndpointTests : IDisposable
     public async Task Wrong_method_on_the_summary_route_is_a_405_problem_response()
     {
         var response = await _factory.CreateClient().PostAsync(InventoryEndpoints.SummaryRoute, content: null);
-        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        var json = await response.ReadJsonAsync();
 
         Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
         Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);

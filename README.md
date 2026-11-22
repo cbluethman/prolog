@@ -167,6 +167,7 @@ Why the pieces are split where they are:
 - **The cache is per process and in memory.** Two instances would each crawl and would compete for the same rate limit. The first request after start or expiry pays the full 11 seconds; there is no background refresh or stale-while-revalidate.
 - **Completeness rests on `totalRecords` being true.** If the API dropped a record and also under-reported `totalRecords`, the check would pass. I do not assume ids are contiguous, so I cannot detect that case. Two cheap checks would narrow it and are not implemented: `totalPages` should equal `totalRecords / pageSize` rounded up, and the page after the last should be empty.
 - **Validation is all or nothing.** One malformed record makes the whole summary unavailable. That is deliberate, but a real consumer might prefer the valid records plus a list of rejects.
+- **An oversized response is reported as unreachable.** A page body over 5 MB is refused while it is being read, which looks like a transport failure: it is retried and ends as a 503, where a 502 for unusable data would be more accurate.
 - **Number parsing is more lenient than the documented contract.** A number sent as a JSON string (`"12"`) is accepted.
 - **Title-casing category names is naive.** A category such as `TV & AUDIO` would display as `Tv & Audio`.
 - **A `Retry-After` longer than the 30 second cap is shortened**, so that retry is likely to be refused again.

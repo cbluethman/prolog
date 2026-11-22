@@ -150,6 +150,8 @@ public class InventoryCollectorTests
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-02-30T12:30:00Z" } },
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T12:30:00+2" } },
         { "unreadable lastUpdated", Record(1) with { LastUpdated = " 2026-10-15T12:30:00Z " } },
+        // A regex "$" would let exactly this one through: a single newline at the very end.
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T12:30:00Z\n" } },
     };
 
     [Theory]

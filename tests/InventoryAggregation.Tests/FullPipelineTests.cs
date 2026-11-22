@@ -1,11 +1,8 @@
 using System.Net;
-using System.Text.Json;
 using InventoryAggregation.Api;
 using InventoryAggregation.Api.Upstream;
 using InventoryAggregation.Tests.Fakes;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -45,11 +42,9 @@ public class FullPipelineTests : IDisposable
         """;
 
     private readonly ScriptedHttpHandler _network = new();
-    private readonly List<TimeSpan> _waits = [];
-    private readonly Dictionary<string, string> _settings = new()
+    private readonly RecordingDelay _recorder = new();
+    private readonly Dictionary<string, string?> _settings = new()
     {
-        ["InventoryApi:BaseUrl"] = "https://inventory.test",
-        ["InventoryApi:ApiKey"] = "test-key",
         ["InventoryApi:PageSize"] = "2",
         ["InventoryApi:MaxAttempts"] = "2",
     };
@@ -58,26 +53,14 @@ public class FullPipelineTests : IDisposable
 
     private HttpClient CreateClient()
     {
-        _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(host =>
-        {
-            host.UseEnvironment("Testing");
-
-            foreach (var (key, value) in _settings)
-            {
-                host.UseSetting(key, value);
-            }
-
-            host.ConfigureTestServices(services =>
+        _factory = TestApp.Create(
+            services =>
             {
                 services.RemoveAll<RetryDelay>();
-                services.AddSingleton<RetryDelay>((wait, _) =>
-                {
-                    _waits.Add(wait);
-                    return Task.CompletedTask;
-                });
+                services.AddSingleton<RetryDelay>(_recorder.Record);
                 services.AddHttpClient(InventoryApiClient.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => _network);
-            });
-        });
+            },
+            _settings);
 
         return _factory.CreateClient();
     }
@@ -93,7 +76,7 @@ public class FullPipelineTests : IDisposable
             .Respond(HttpStatusCode.OK, PageTwo);
 
         var response = await CreateClient().GetAsync(InventoryEndpoints.SummaryRoute);
-        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        var json = await response.ReadJsonAsync();
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
@@ -112,7 +95,7 @@ public class FullPipelineTests : IDisposable
             ],
             _network.RequestUris.Select(uri => uri?.ToString()));
         Assert.All(_network.ApiKeysSent, key => Assert.Equal("test-key", key));
-        Assert.Equal(TimeSpan.FromSeconds(2.25), Assert.Single(_waits));
+        Assert.Equal(TimeSpan.FromSeconds(2.25), Assert.Single(_recorder.Waits));
     }
 
     [Fact]
@@ -143,7 +126,7 @@ public class FullPipelineTests : IDisposable
 
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         Assert.Equal(1, _network.RequestCount);
-        Assert.DoesNotContain("test-key", body);
+        Assert.DoesNotContain(TestSettings.ApiKey, body);
     }
 
     [Fact]
@@ -157,7 +140,7 @@ public class FullPipelineTests : IDisposable
         var body = await response.Content.ReadAsStringAsync();
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
-        Assert.DoesNotContain("inventory.test", body);
+        Assert.DoesNotContain(new Uri(TestSettings.BaseUrl).Host, body);
     }
 
     [Theory]

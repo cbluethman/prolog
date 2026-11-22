@@ -84,31 +84,12 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory, Tim
             HttpStatusCode.TooManyRequests => new InventoryUnavailableException(
                 InventoryFailureReason.RateLimited,
                 $"The Inventory API is still rate limiting this service after retries (page {page}).",
-                retryAfter: RetryAfter(response)),
+                retryAfter: RetryAfterHeader.Read(response, timeProvider)),
 
             _ => new InventoryUnavailableException(
                 InventoryFailureReason.UpstreamError,
                 $"The Inventory API returned HTTP {status} for page {page}."),
         };
-    }
-
-    /// <summary>Retry-After as a duration, whether the server sent seconds or an HTTP date.</summary>
-    private TimeSpan? RetryAfter(HttpResponseMessage response)
-    {
-        var retryAfter = response.Headers.RetryAfter;
-
-        if (retryAfter?.Delta is { } seconds)
-        {
-            return seconds;
-        }
-
-        if (retryAfter?.Date is { } date)
-        {
-            var remaining = date - timeProvider.GetUtcNow();
-            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
-        }
-
-        return null;
     }
 
     /// <summary>
@@ -128,23 +109,19 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory, Tim
         }
         catch (JsonException exception)
         {
-            throw new InventoryUnavailableException(
-                InventoryFailureReason.InvalidData,
-                $"The Inventory API returned a body that is not the expected JSON for page {page}.",
-                exception);
+            throw InventoryUnavailableException.InvalidData(
+                $"The Inventory API returned a body that is not the expected JSON for page {page}.", exception);
         }
 
         if (dto is not { Records: not null, Page: not null, TotalPages: not null, TotalRecords: not null })
         {
-            throw new InventoryUnavailableException(
-                InventoryFailureReason.InvalidData,
+            throw InventoryUnavailableException.InvalidData(
                 $"The Inventory API response for page {page} is missing records, page, totalPages or totalRecords.");
         }
 
         if (dto.Records.Any(record => record is null))
         {
-            throw new InventoryUnavailableException(
-                InventoryFailureReason.InvalidData,
+            throw InventoryUnavailableException.InvalidData(
                 $"The Inventory API response for page {page} contains a null record.");
         }
 

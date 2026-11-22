@@ -116,10 +116,8 @@ public sealed class InventorySummaryService(
             catch (OverflowException exception)
             {
                 // Valid-looking but absurd numbers: price x quantity no longer fits in a decimal.
-                throw new InventoryUnavailableException(
-                    InventoryFailureReason.InvalidData,
-                    "The Inventory API returned prices and quantities too large to total.",
-                    exception);
+                throw InventoryUnavailableException.InvalidData(
+                    "The Inventory API returned prices and quantities too large to total.", exception);
             }
 
             var now = timeProvider.GetUtcNow();

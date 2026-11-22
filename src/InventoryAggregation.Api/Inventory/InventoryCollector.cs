@@ -32,7 +32,7 @@ public sealed partial class InventoryCollector(
     /// offset may be Z, +02:00, +0200, +02 or absent (absent means UTC, as the API documents).
     /// </summary>
     [GeneratedRegex(
-        @"^(?<date>\d{4}-\d{2}-\d{2})[Tt](?<time>\d{2}:\d{2})(:(?<seconds>\d{2})(\.(?<fraction>\d+))?)?(?<offset>[Zz]|[+-]\d{2}(:?\d{2})?)?$",
+        @"^(?<date>\d{4}-\d{2}-\d{2})[Tt](?<time>\d{2}:\d{2})(:(?<seconds>\d{2})(\.(?<fraction>\d+))?)?(?<offset>[Zz]|[+-]\d{2}(:?\d{2})?)?\z",
         RegexOptions.CultureInvariant)]
     private static partial Regex Iso8601DateTime();
 
@@ -60,7 +60,7 @@ public sealed partial class InventoryCollector(
         // records across page boundaries, so the row count is larger than the dataset.
         if (recordsById.Count != first.TotalRecords)
         {
-            throw Invalid(
+            throw InventoryUnavailableException.InvalidData(
                 $"Collected {recordsById.Count} unique records from {first.TotalPages} pages, " +
                 $"but the API reports totalRecords = {first.TotalRecords}.");
         }
@@ -76,18 +76,18 @@ public sealed partial class InventoryCollector(
     {
         if (page.Page != requestedPage)
         {
-            throw Invalid($"Requested page {requestedPage} but the response says it is page {page.Page}.");
+            throw InventoryUnavailableException.InvalidData($"Requested page {requestedPage} but the response says it is page {page.Page}.");
         }
 
         if (page.TotalPages is < 0 or > MaxPages || page.TotalRecords < 0)
         {
-            throw Invalid(
+            throw InventoryUnavailableException.InvalidData(
                 $"Page {requestedPage} reports totalPages = {page.TotalPages}, totalRecords = {page.TotalRecords}.");
         }
 
         if (page.TotalPages != first.TotalPages || page.TotalRecords != first.TotalRecords)
         {
-            throw Invalid(
+            throw InventoryUnavailableException.InvalidData(
                 $"Page {requestedPage} reports totalPages = {page.TotalPages}, totalRecords = {page.TotalRecords}, " +
                 $"but page 1 reported {first.TotalPages} and {first.TotalRecords}. The dataset changed mid-crawl.");
         }
@@ -111,7 +111,7 @@ public sealed partial class InventoryCollector(
             else
             {
                 // Same id, different content: there is no way to know which one is right.
-                throw Invalid($"Record {record.Id} appears more than once with different content (page {page.Page}).");
+                throw InventoryUnavailableException.InvalidData($"Record {record.Id} appears more than once with different content (page {page.Page}).");
             }
         }
     }
@@ -120,34 +120,34 @@ public sealed partial class InventoryCollector(
     {
         if (raw.Id is not > 0)
         {
-            throw Invalid($"A record on page {page} has a missing or non-positive id ({Show(raw.Id)}).");
+            throw InventoryUnavailableException.InvalidData($"A record on page {page} has a missing or non-positive id ({Show(raw.Id)}).");
         }
 
         var id = raw.Id.Value;
 
         if (string.IsNullOrWhiteSpace(raw.Name))
         {
-            throw Invalid($"Record {id} has no name.");
+            throw InventoryUnavailableException.InvalidData($"Record {id} has no name.");
         }
 
         if (string.IsNullOrWhiteSpace(raw.Category))
         {
-            throw Invalid($"Record {id} has no category.");
+            throw InventoryUnavailableException.InvalidData($"Record {id} has no category.");
         }
 
         if (raw.Price is not >= 0)
         {
-            throw Invalid($"Record {id} has a missing or negative price ({Show(raw.Price)}).");
+            throw InventoryUnavailableException.InvalidData($"Record {id} has a missing or negative price ({Show(raw.Price)}).");
         }
 
         if (raw.Quantity is not >= 0)
         {
-            throw Invalid($"Record {id} has a missing or negative quantity ({Show(raw.Quantity)}).");
+            throw InventoryUnavailableException.InvalidData($"Record {id} has a missing or negative quantity ({Show(raw.Quantity)}).");
         }
 
         if (!TryParseIso8601(raw.LastUpdated, out var lastUpdated))
         {
-            throw Invalid($"Record {id} has an unreadable lastUpdated ({Show(raw.LastUpdated)}).");
+            throw InventoryUnavailableException.InvalidData($"Record {id} has an unreadable lastUpdated ({Show(raw.LastUpdated)}).");
         }
 
         return new InventoryRecord(id, raw.Name, raw.Category, raw.Price.Value, raw.Quantity.Value, lastUpdated.UtcDateTime);
@@ -201,7 +201,4 @@ public sealed partial class InventoryCollector(
 
         return text.Length <= maxLength ? $"'{text}'" : $"'{text[..maxLength]}...'";
     }
-
-    private static InventoryUnavailableException Invalid(string message) =>
-        new(InventoryFailureReason.InvalidData, message);
 }

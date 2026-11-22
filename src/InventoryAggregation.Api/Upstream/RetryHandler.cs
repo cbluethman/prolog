@@ -65,15 +65,15 @@ public sealed class RetryHandler(
                 catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
                 {
                     // The caller did not cancel, so it was our per-attempt timeout.
+                    var withinLimit = $"within {_options.AttemptTimeout.TotalSeconds:0.#} s";
+
                     if (isLastAttempt)
                     {
                         response?.Dispose();
-                        throw new TimeoutException(
-                            $"No response within {_options.AttemptTimeout.TotalSeconds:0.#} s on any of {attempt} attempts.",
-                            exception);
+                        throw new TimeoutException($"No response {withinLimit} on any of {attempt} attempts.", exception);
                     }
 
-                    failure = $"no response within {_options.AttemptTimeout.TotalSeconds:0.#} s";
+                    failure = $"no response {withinLimit}";
                 }
                 catch
                 {
@@ -108,10 +108,10 @@ public sealed class RetryHandler(
     {
         double waitMs;
 
-        if (ServerRequestedDelay(response) is { } requested)
+        if (RetryAfterHeader.Read(response, timeProvider) is { } requested)
         {
             // The server told us when to come back (the live API does this on 429). Believe it.
-            waitMs = Math.Max(requested.TotalMilliseconds, 0) + RetryAfterPadding.TotalMilliseconds;
+            waitMs = requested.TotalMilliseconds + RetryAfterPadding.TotalMilliseconds;
         }
         else
         {
@@ -123,23 +123,5 @@ public sealed class RetryHandler(
 
         // Capped while still a plain number, so a large attempt count cannot overflow TimeSpan.
         return TimeSpan.FromMilliseconds(Math.Min(waitMs, _options.MaxRetryDelay.TotalMilliseconds));
-    }
-
-    /// <summary>Retry-After can be a number of seconds or an HTTP date.</summary>
-    private TimeSpan? ServerRequestedDelay(HttpResponseMessage? response)
-    {
-        var retryAfter = response?.Headers.RetryAfter;
-
-        if (retryAfter?.Delta is { } seconds)
-        {
-            return seconds;
-        }
-
-        if (retryAfter?.Date is { } date)
-        {
-            return date - timeProvider.GetUtcNow();
-        }
-
-        return null;
     }
 }
