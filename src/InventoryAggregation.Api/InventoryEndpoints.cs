@@ -13,8 +13,14 @@ public static class InventoryEndpoints
     /// <summary>An upstream Retry-After far in the future is passed on as at most one hour.</summary>
     private const int MaxRetryAfterSeconds = 3600;
 
-    public static void MapInventoryEndpoints(this IEndpointRouteBuilder app) =>
+    public static void MapInventoryEndpoints(this IEndpointRouteBuilder app)
+    {
         app.MapGet(SummaryRoute, GetSummaryAsync);
+
+        // A convenience for someone who opens the base address in a browser.
+        // A temporary redirect (302), so nothing caches it if the route ever moves.
+        app.MapGet("/", () => Results.Redirect(SummaryRoute));
+    }
 
     private static async Task<IResult> GetSummaryAsync(
         IInventorySummaryService summaryService,

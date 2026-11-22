@@ -282,6 +282,18 @@ public class SummaryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Root_redirects_to_the_summary_without_touching_the_upstream()
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+        var response = await client.GetAsync("/");
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal(InventoryEndpoints.SummaryRoute, response.Headers.Location?.OriginalString);
+        Assert.Empty(_upstream.RequestedPages);
+    }
+
+    [Fact]
     public async Task Unknown_route_is_a_404_problem_response()
     {
         var response = await _factory.CreateClient().GetAsync("/api/inventory/nothing-here");

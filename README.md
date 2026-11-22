@@ -44,6 +44,8 @@ It listens on `http://localhost:5211`.
 curl http://localhost:5211/api/inventory/summary
 ```
 
+Opening the base address, `http://localhost:5211/`, in a browser redirects there.
+
 The first call takes about 11 seconds (see [rate limiting](#what-the-inventory-api-actually-does)). Calls in the next five minutes are answered from memory. If the client gives up before then, the crawl still finishes, so the next call is answered from memory too.
 
 ### 4. Run the tests
