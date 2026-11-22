@@ -17,7 +17,7 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
 
     public int RequestCount => RequestUris.Count;
 
-    /// <summary>Responses made by <see cref="RespondWithBrokenBody"/>, so a test can check they were released.</summary>
+    /// <summary>Every response handed out, in order, so a test can check they were released.</summary>
     public List<TrackedResponse> Responses { get; } = [];
 
     public ScriptedHttpHandler Respond(
@@ -25,10 +25,11 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
     {
         _steps.Enqueue(_ =>
         {
-            var response = new HttpResponseMessage(status)
+            var response = new TrackedResponse(status)
             {
                 Content = new StringContent(body, Encoding.UTF8, "application/json"),
             };
+            Responses.Add(response);
 
             if (retryAfter is not null)
             {
@@ -47,7 +48,7 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
                 response.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
             }
 
-            return Task.FromResult(response);
+            return Task.FromResult<HttpResponseMessage>(response);
         });
         return this;
     }
@@ -70,10 +71,15 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
     /// <summary>Headers arrive, then the body never does; reading ends only when cancelled.</summary>
     public ScriptedHttpHandler RespondWithStalledBody(HttpStatusCode status)
     {
-        _steps.Enqueue(_ => Task.FromResult(new HttpResponseMessage(status)
+        _steps.Enqueue(_ =>
         {
-            Content = new ScriptedBody(cancellationToken => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)),
-        }));
+            var response = new TrackedResponse(status)
+            {
+                Content = new ScriptedBody(cancellationToken => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)),
+            };
+            Responses.Add(response);
+            return Task.FromResult<HttpResponseMessage>(response);
+        });
         return this;
     }
 

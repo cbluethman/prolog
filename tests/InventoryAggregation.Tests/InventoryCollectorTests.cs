@@ -1,3 +1,4 @@
+using System.Globalization;
 using InventoryAggregation.Api;
 using InventoryAggregation.Api.Inventory;
 using InventoryAggregation.Tests.Fakes;
@@ -141,6 +142,14 @@ public class InventoryCollectorTests
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "10/15/2026" } },
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15" } },
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-13-45T12:30:00Z" } },
+        // Close to ISO 8601, and still not it.
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15 12:30:00Z" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T12:30:00.Z" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T12:30:00." } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T24:00:00Z" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-02-30T12:30:00Z" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15T12:30:00+2" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = " 2026-10-15T12:30:00Z " } },
     };
 
     [Theory]
@@ -155,12 +164,33 @@ public class InventoryCollectorTests
         Assert.Contains(brokenRule, exception.Message);
     }
 
+    [Fact]
+    public async Task Invalid_record_on_a_later_page_fails_the_whole_collection()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 2, totalRecords: 2, Record(1))
+            .WithPage(2, totalPages: 2, totalRecords: 2, Record(2) with { LastUpdated = null });
+
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.Contains("Record 2", exception.Message);
+    }
+
     [Theory]
     [InlineData("2026-10-15T12:30:00Z")]
     [InlineData("2026-10-15T12:30:00.5Z")]
     [InlineData("2026-10-15T12:30:00.1234567Z")]
     [InlineData("2026-10-15T14:30:00+02:00")]
     [InlineData("2026-10-15T12:30:00")]
+    // Each of these is valid ISO 8601 or RFC 3339, and each is what some serializer emits.
+    [InlineData("2026-10-15T12:30:00z")]
+    [InlineData("2026-10-15t12:30:00Z")]
+    [InlineData("2026-10-15T12:30Z")]
+    [InlineData("2026-10-15T14:30:00+02")]
+    [InlineData("2026-10-15T14:30:00+0200")]
+    [InlineData("2026-10-15T07:00:00-05:30")]
+    [InlineData("2026-10-15T12:30:00.123456789Z")]
+    [InlineData("2026-10-15T12:30:00-00:00")]
     public async Task Iso_8601_last_updated_is_accepted_in_each_of_its_forms(string lastUpdated)
     {
         var client = new FakeInventoryApiClient()
@@ -401,5 +431,56 @@ public class InventoryCollectorTests
         var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
 
         Assert.Equal("  home &  KITCHEN ", record.Category);
+    }
+
+    [Fact]
+    public async Task Cancellation_before_the_first_page_requests_nothing()
+    {
+        using var caller = new CancellationTokenSource();
+        var client = new FakeInventoryApiClient().WithPage(1, totalPages: 1, totalRecords: 1, Record(1));
+        await caller.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => CollectorFor(client).CollectAllAsync(caller.Token));
+
+        Assert.Empty(client.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Largest_total_pages_that_is_still_believed_is_crawled_to_the_end()
+    {
+        const int limit = 10_000;
+        var client = new FakeInventoryApiClient().WithPage(1, limit, totalRecords: 2, Record(1));
+        for (var page = 2; page < limit; page++)
+        {
+            client.WithPage(page, limit, totalRecords: 2);
+        }
+        client.WithPage(limit, limit, totalRecords: 2, Record(2));
+
+        var records = await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([1, 2], records.Select(record => record.Id));
+        Assert.Equal(limit, client.RequestedPages.Count);
+    }
+
+    [Fact]
+    public async Task Last_updated_is_read_the_same_whatever_the_culture_of_the_machine()
+    {
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            // The Thai calendar counts years from 543 BC, so there "2026" is not this year.
+            CultureInfo.CurrentCulture = new CultureInfo("th-TH");
+            var client = new FakeInventoryApiClient()
+                .WithPage(1, totalPages: 1, totalRecords: 1, Record(1, lastUpdated: "2026-10-15T12:30:00Z"));
+
+            var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+            Assert.Equal(new DateTime(2026, 10, 15, 12, 30, 0, DateTimeKind.Utc), record.LastUpdated);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 }

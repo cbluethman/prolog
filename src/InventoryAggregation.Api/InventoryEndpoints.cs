@@ -1,3 +1,4 @@
+using System.Globalization;
 using InventoryAggregation.Api.Inventory;
 
 namespace InventoryAggregation.Api;
@@ -8,6 +9,9 @@ public static class InventoryEndpoints
 
     /// <summary>Suggested wait when the upstream API gave no Retry-After of its own.</summary>
     private static readonly TimeSpan DefaultRetryAfter = TimeSpan.FromSeconds(30);
+
+    /// <summary>An upstream Retry-After far in the future is passed on as at most one hour.</summary>
+    private const int MaxRetryAfterSeconds = 3600;
 
     public static void MapInventoryEndpoints(this IEndpointRouteBuilder app) =>
         app.MapGet(SummaryRoute, GetSummaryAsync);
@@ -24,15 +28,18 @@ public static class InventoryEndpoints
         }
         catch (InventoryUnavailableException exception)
         {
-            loggerFactory.CreateLogger(typeof(InventoryEndpoints).FullName!).LogError(
-                exception, "Could not build the inventory summary: {Reason}", exception.Reason);
-
             var (status, title) = Describe(exception.Reason);
+
+            // The crawl has already logged the failure in full, once. This is the per-request line.
+            loggerFactory.CreateLogger(typeof(InventoryEndpoints).FullName!).LogWarning(
+                "Returning {Status} for the inventory summary: {Reason}: {Message}",
+                status, exception.Reason, exception.Message);
 
             if (status == StatusCodes.Status503ServiceUnavailable)
             {
                 var retryAfter = exception.RetryAfter ?? DefaultRetryAfter;
-                httpContext.Response.Headers.RetryAfter = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+                var seconds = Math.Clamp(Math.Ceiling(retryAfter.TotalSeconds), 0, MaxRetryAfterSeconds);
+                httpContext.Response.Headers.RetryAfter = ((int)seconds).ToString(CultureInfo.InvariantCulture);
             }
 
             // RFC 7807 problem+json. The detail is one of our own messages, never a stack trace.

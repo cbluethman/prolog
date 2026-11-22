@@ -110,6 +110,20 @@ public class InventoryAggregatorTests
     }
 
     [Fact]
+    public void Most_recently_updated_is_decided_by_the_time_of_day_too()
+    {
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Outdoor", lastUpdated: "2026-09-03T08:00:00Z"),
+            Record(2, "Outdoor", lastUpdated: "2026-09-03T17:30:00Z"),
+            Record(3, "Outdoor", lastUpdated: "2026-09-03T17:29:59Z"),
+        ]);
+
+        // Same day for all three, so this is not a tie for the lowest id to settle.
+        Assert.Equal(2, Assert.Single(result).MostRecentlyUpdated.Id);
+    }
+
+    [Fact]
     public void Tie_on_last_updated_goes_to_the_lowest_id()
     {
         var result = _aggregator.Aggregate(
@@ -297,5 +311,29 @@ public class InventoryAggregatorTests
         Assert.Equal(
             new CategoryItem(1001, "Thermal Receipt Printer", 149.99m, 12, lastUpdated),
             Assert.Single(Assert.Single(result).Items));
+    }
+
+    [Fact]
+    public void Category_order_does_not_depend_on_the_culture_of_the_machine()
+    {
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            // Czech sorts "ch" as one letter that comes after "h".
+            CultureInfo.CurrentCulture = new CultureInfo("cs-CZ");
+
+            var result = _aggregator.Aggregate(
+            [
+                Record(1, "Hats"),
+                Record(2, "Chairs"),
+                Record(3, "Electronics"),
+            ]);
+
+            Assert.Equal(["Chairs", "Electronics", "Hats"], result.Select(category => category.Category));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 }

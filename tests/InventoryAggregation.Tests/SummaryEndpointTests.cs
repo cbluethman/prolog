@@ -91,6 +91,17 @@ public class SummaryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Summary_is_served_at_the_documented_path()
+    {
+        _upstream.WithPage(1, totalPages: 0, totalRecords: 0);
+
+        // Spelled out, not taken from the constant: clients have this path in their own code.
+        var response = await _factory.CreateClient().GetAsync("/api/inventory/summary");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
     public async Task Second_request_is_served_from_the_cache()
     {
         _upstream.WithPage(1, totalPages: 1, totalRecords: 1, Record(1));
@@ -102,13 +113,14 @@ public class SummaryEndpointTests : IDisposable
     }
 
     [Theory]
-    [InlineData(InventoryFailureReason.Unreachable, HttpStatusCode.ServiceUnavailable)]
-    [InlineData(InventoryFailureReason.RateLimited, HttpStatusCode.ServiceUnavailable)]
-    [InlineData(InventoryFailureReason.Timeout, HttpStatusCode.GatewayTimeout)]
-    [InlineData(InventoryFailureReason.Unauthorized, HttpStatusCode.BadGateway)]
-    [InlineData(InventoryFailureReason.UpstreamError, HttpStatusCode.BadGateway)]
-    [InlineData(InventoryFailureReason.InvalidData, HttpStatusCode.BadGateway)]
-    public async Task Upstream_failure_becomes_a_problem_response(InventoryFailureReason reason, HttpStatusCode expected)
+    [InlineData(InventoryFailureReason.Unreachable, HttpStatusCode.ServiceUnavailable, "unreachable")]
+    [InlineData(InventoryFailureReason.RateLimited, HttpStatusCode.ServiceUnavailable, "rate limiting")]
+    [InlineData(InventoryFailureReason.Timeout, HttpStatusCode.GatewayTimeout, "timed out")]
+    [InlineData(InventoryFailureReason.Unauthorized, HttpStatusCode.BadGateway, "credentials")]
+    [InlineData(InventoryFailureReason.UpstreamError, HttpStatusCode.BadGateway, "returned an error")]
+    [InlineData(InventoryFailureReason.InvalidData, HttpStatusCode.BadGateway, "incomplete or inconsistent data")]
+    public async Task Upstream_failure_becomes_a_problem_response(
+        InventoryFailureReason reason, HttpStatusCode expected, string titleSays)
     {
         _upstream.Failure = new InventoryUnavailableException(reason, "what went wrong");
 
@@ -118,7 +130,8 @@ public class SummaryEndpointTests : IDisposable
         Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
         Assert.Equal((int)expected, json.GetProperty("status").GetInt32());
         Assert.Equal("what went wrong", json.GetProperty("detail").GetString());
-        Assert.False(string.IsNullOrWhiteSpace(json.GetProperty("title").GetString()));
+        // Three reasons share 502, so the title is what tells a rejected key from bad data.
+        Assert.Contains(titleSays, json.GetProperty("title").GetString());
     }
 
     [Fact]
@@ -160,6 +173,17 @@ public class SummaryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Upstream_retry_after_far_in_the_future_is_passed_on_as_at_most_an_hour()
+    {
+        _upstream.Failure = new InventoryUnavailableException(
+            InventoryFailureReason.RateLimited, "throttled", retryAfter: TimeSpan.FromDays(40000));
+
+        var (response, _) = await GetSummaryAsync();
+
+        Assert.Equal(TimeSpan.FromHours(1), response.Headers.RetryAfter?.Delta);
+    }
+
+    [Fact]
     public async Task Unexpected_exception_is_a_500_problem_without_a_stack_trace()
     {
         _upstream.Failure = new InvalidOperationException("secret internal detail");
@@ -196,6 +220,17 @@ public class SummaryEndpointTests : IDisposable
 
         // Rounding down would invite the caller back while the upstream is still throttling.
         Assert.Equal(["8"], response.Headers.GetValues("Retry-After"));
+    }
+
+    [Fact]
+    public async Task Upstream_retry_after_that_has_already_passed_is_passed_on_as_zero_not_replaced_by_the_default()
+    {
+        _upstream.Failure = new InventoryUnavailableException(
+            InventoryFailureReason.RateLimited, "throttled", retryAfter: TimeSpan.Zero);
+
+        var (response, _) = await GetSummaryAsync();
+
+        Assert.Equal(["0"], response.Headers.GetValues("Retry-After"));
     }
 
     [Theory]

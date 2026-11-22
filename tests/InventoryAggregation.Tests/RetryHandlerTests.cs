@@ -42,8 +42,23 @@ public class RetryHandlerTests
         return new HttpMessageInvoker(handler);
     }
 
-    private Task<HttpResponseMessage> SendAsync(CancellationToken cancellationToken = default) =>
-        CreateInvoker().SendAsync(new HttpRequestMessage(HttpMethod.Get, "https://inventory.test/api/records"), cancellationToken);
+    private async Task<HttpResponseMessage> SendAsync(CancellationToken cancellationToken = default)
+    {
+        var sending = CreateInvoker().SendAsync(
+            new HttpRequestMessage(HttpMethod.Get, "https://inventory.test/api/records"), cancellationToken);
+
+        // A handler that never finishes should fail its test, not hang the whole run. Not WaitAsync:
+        // its TimeoutException would look like the handler's own to the tests that expect one.
+        using var patience = new CancellationTokenSource();
+        var gaveUp = Task.Delay(TimeSpan.FromSeconds(10), patience.Token);
+        if (await Task.WhenAny(sending, gaveUp) == gaveUp)
+        {
+            throw new InvalidOperationException("The retry handler did not finish within 10 seconds.");
+        }
+
+        await patience.CancelAsync();
+        return await sending;
+    }
 
     [Fact]
     public async Task Success_is_returned_without_retrying()
@@ -378,7 +393,7 @@ public class RetryHandlerTests
         _network.Respond(HttpStatusCode.InternalServerError).Respond(HttpStatusCode.OK);
 
         var pending = SendAsync(caller.Token);
-        await waiting.Task;
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await caller.CancelAsync();
 
         // The time limit only turns a hang into a failure if the wait ignores the caller.
@@ -419,7 +434,108 @@ public class RetryHandlerTests
 
         var response = await SendAsync();
 
-        Assert.Equal("complete", await response.Content.ReadAsStringAsync());
+        // Counted first: if the stalled response were handed back, reading it would never end.
         Assert.Equal(2, _network.RequestCount);
+        Assert.Equal("complete", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task No_status_outside_the_transient_six_is_ever_retried()
+    {
+        HttpStatusCode[] transient =
+        [
+            HttpStatusCode.RequestTimeout, HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError,
+            HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout,
+        ];
+        var retried = new List<int>();
+
+        // 1xx is left out: HttpClient never hands an interim response to a handler.
+        foreach (var status in Enumerable.Range(200, 400).Select(code => (HttpStatusCode)code).Except(transient))
+        {
+            _network.Respond(status);
+            var requestsBefore = _network.RequestCount;
+
+            using var response = await SendAsync();
+
+            if (response.StatusCode != status || _network.RequestCount != requestsBefore + 1)
+            {
+                retried.Add((int)status);
+            }
+        }
+
+        Assert.Empty(retried);
+        Assert.Empty(_waits);
+    }
+
+    [Fact]
+    public async Task Backoff_jitter_spreads_retries_over_half_the_base_delay()
+    {
+        // One first retry per send, so every wait is the 100 ms base plus that send's jitter.
+        for (var i = 0; i < 40; i++)
+        {
+            _network.Respond(HttpStatusCode.InternalServerError).Respond(HttpStatusCode.OK);
+            await SendAsync();
+        }
+
+        Assert.Equal(40, _waits.Count);
+        Assert.All(_waits, wait => Assert.InRange(wait, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150)));
+        // Forty random draws from a 50 ms range landing within 5 ms of each other would be about 1 in 10^38.
+        Assert.True(_waits.Max() - _waits.Min() > TimeSpan.FromMilliseconds(5), "every retry waited the same time");
+    }
+
+    [Fact]
+    public async Task Zero_base_backoff_retries_without_waiting()
+    {
+        _options.BaseBackoff = TimeSpan.Zero;
+        _network.Respond(HttpStatusCode.InternalServerError).Respond(HttpStatusCode.InternalServerError).Respond(HttpStatusCode.OK);
+
+        await SendAsync();
+
+        Assert.Equal([TimeSpan.Zero, TimeSpan.Zero], _waits);
+    }
+
+    [Fact]
+    public async Task Response_that_is_retried_is_released_before_the_next_attempt()
+    {
+        _network
+            .Respond(HttpStatusCode.ServiceUnavailable)
+            .Respond(HttpStatusCode.TooManyRequests, retryAfter: "1")
+            .Respond(HttpStatusCode.OK);
+        var releasedWhenWaiting = new List<bool>();
+        _delay = (_, _) =>
+        {
+            releasedWhenWaiting.Add(_network.Responses[^1].Disposed);
+            return Task.CompletedTask;
+        };
+
+        await SendAsync();
+
+        Assert.Equal([true, true], releasedWhenWaiting);
+    }
+
+    [Fact]
+    public async Task Response_is_released_when_its_body_stalls_on_the_last_attempt()
+    {
+        _options.MaxAttempts = 1;
+        _options.AttemptTimeout = TimeSpan.FromMilliseconds(50);
+        _network.RespondWithStalledBody(HttpStatusCode.OK);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => SendAsync());
+
+        Assert.True(Assert.Single(_network.Responses).Disposed);
+    }
+
+    [Fact]
+    public async Task Response_is_released_when_the_caller_cancels_while_its_body_is_arriving()
+    {
+        using var caller = new CancellationTokenSource();
+        _network.RespondWithStalledBody(HttpStatusCode.OK);
+
+        var pending = SendAsync(caller.Token);
+        await caller.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.True(Assert.Single(_network.Responses).Disposed);
+        Assert.Equal(1, _network.RequestCount);
     }
 }

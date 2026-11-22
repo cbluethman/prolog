@@ -6,8 +6,9 @@ namespace InventoryAggregation.Api.Upstream;
 
 /// <summary>
 /// The only class that knows the inventory lives behind HTTP and JSON.
-/// Every way a request can fail leaves here as an <see cref="InventoryUnavailableException"/>;
-/// the only other exception that can leave is the caller's own cancellation.
+/// Every way a request can fail leaves here as an <see cref="InventoryUnavailableException"/>.
+/// Two things are deliberately not wrapped: the caller's own cancellation, and invalid
+/// configuration, which is this service's fault and is rejected at startup, not the API's.
 /// Retries have already happened by then: they live in <see cref="RetryHandler"/>,
 /// which is part of the named HttpClient's pipeline.
 /// </summary>

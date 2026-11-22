@@ -23,6 +23,9 @@ public sealed class RetryHandler(
     /// <summary>Added to a server-supplied Retry-After so we do not arrive a moment too early.</summary>
     private static readonly TimeSpan RetryAfterPadding = TimeSpan.FromMilliseconds(250);
 
+    /// <summary>A page of 25 records is a few kilobytes. Anything near this size is not a page.</summary>
+    private const long MaxResponseBytes = 5 * 1024 * 1024;
+
     private readonly InventoryApiOptions _options = options.Value;
 
     protected override async Task<HttpResponseMessage> SendAsync(
@@ -45,7 +48,8 @@ public sealed class RetryHandler(
 
                     // Read the whole body here so a connection that drops or stalls mid-body
                     // is covered by the same timeout and retry as the headers.
-                    await response.Content.LoadIntoBufferAsync(attemptCancellation.Token);
+                    // The size limit stops a runaway response from being held in memory.
+                    await response.Content.LoadIntoBufferAsync(MaxResponseBytes, attemptCancellation.Token);
 
                     if (!IsTransient(response.StatusCode) || isLastAttempt)
                     {

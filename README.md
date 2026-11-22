@@ -28,7 +28,7 @@ export InventoryApi__BaseUrl="<base url>"     # PowerShell: $env:InventoryApi__B
 export InventoryApi__ApiKey="<api key>"       # PowerShell: $env:InventoryApi__ApiKey  = "<api key>"
 ```
 
-User secrets are only loaded in the `Development` environment, which is what `dotnet run` uses by default. If either value is missing the app refuses to start and says which one.
+User secrets are only loaded in the `Development` environment, which is what `dotnet run` uses by default. If either value is missing or malformed (a base URL that is not `https`, a key with a trailing newline or a non-ASCII character) the app refuses to start and says which one.
 
 ### 2. Run
 
@@ -87,14 +87,14 @@ Against the current dataset the service returns:
 
 ### When the upstream API fails
 
-The endpoint never returns partial figures and never lets an exception escape. Failures are `application/problem+json`:
+The endpoint never returns partial figures, and every failure is `application/problem+json` with no stack trace:
 
 | Status | When |
 |---|---|
 | 502 Bad Gateway | The Inventory API answered with something unusable: an error status after retries, a rejected API key, malformed JSON, or data that fails the completeness and consistency checks |
-| 503 Service Unavailable (with `Retry-After`) | The Inventory API could not be reached, or was still rate limiting after retries |
+| 503 Service Unavailable (with `Retry-After`) | The Inventory API could not be reached, was still rate limiting after retries, or this service is shutting down mid-crawl |
 | 504 Gateway Timeout | The Inventory API did not answer in time, or the whole crawl exceeded its 45 second budget |
-| 500 | Anything unforeseen. Still problem+json, with no stack trace |
+| 500 | Anything unforeseen: a bug in this service |
 
 ## What the Inventory API actually does
 
@@ -138,7 +138,7 @@ Why the pieces are split where they are:
 - **`InventoryAggregator` is a pure function over `InventoryRecord`s.** The business rules are the part most likely to change, so they have no dependencies and are tested with plain in-memory lists.
 - **`InventoryCollector` owns "is this dataset complete and consistent?"** and depends only on the `IInventoryApiClient` interface. It is tested against a fake that can serve overlapping, short, contradictory or invalid pages.
 - **`InventoryApiClient` owns HTTP and JSON**, and only that. It answers "did I get a structurally complete page?" and reports every failure as one exception type with a reason, so nothing above it handles `HttpRequestException` or status codes.
-- **`RetryHandler` is the only place that retries.** Putting it in the `HttpClient` pipeline means the client sees one logical request. It is hand-written, about 100 lines, rather than Polly or `Microsoft.Extensions.Http.Resilience`: the policy is small enough to read in full, and I would rather own every line of the resilience behaviour in an exercise that is about exactly that. In production I would use the library.
+- **`RetryHandler` is the only place that retries.** Putting it in the `HttpClient` pipeline means the client sees one logical request. It is hand-written, about 150 lines, rather than Polly or `Microsoft.Extensions.Http.Resilience`: the policy is small enough to read in full, and I would rather own every line of the resilience behaviour in an exercise that is about exactly that. In production I would use the library.
 - **`InventorySummaryService` owns the cache and the crawl in progress.** It is the only stateful class. A crawl is one shared task that every concurrent caller awaits. It runs on the application's lifetime and its own 45 second budget, not on the request that happened to start it: a caller that disconnects stops waiting, but the crawl finishes and is cached. Concurrent callers also share a failure instead of each queuing a crawl of their own.
 
 ## Decisions I made where the brief left it open
@@ -146,7 +146,7 @@ Why the pieces are split where they are:
 - **Category normalisation.** Categories that differ only by case or whitespace are the same category. The display name is the title-cased key, so `"  home & kitchen "` is reported as `Home & Kitchen`.
 - **`Discontinued` does not appear in the output.** Zero-quantity records are excluded before grouping, as the brief orders the steps, and every `Discontinued` record has quantity 0. A category with no available stock has no figures to report and no "most recently updated" record. The alternative, an entry with zero count and a null record, seemed worse for callers.
 - **Fail closed.** If any page fails after retries, any record is invalid, or the unique count does not match `totalRecords`, the endpoint returns an error instead of figures computed from part of the data. A wrong total that looks right is worse than no total.
-- **A record is invalid** if it has a missing or non-positive id, a blank name or category, a missing or negative price or quantity, or a `lastUpdated` that is not an ISO 8601 date and time. One invalid record fails the whole request. The date check is exact on purpose: a lenient parser reads `"12:30"` as today at 12:30, and an invented date could win "most recently updated". A value with no offset is taken as UTC, as the API documents.
+- **A record is invalid** if it has a missing or non-positive id, a blank name or category, a missing or negative price or quantity, or a `lastUpdated` that is not an ISO 8601 date and time. One invalid record fails the whole request. The date check is by pattern on purpose: a lenient parser reads `"12:30"` as today at 12:30, and an invented date could win "most recently updated". Accepted: `2026-10-15T12:30:00Z`, with seconds and fractional seconds optional, `T` and `Z` in either case, and an offset of `Z`, `+02:00`, `+0200`, `+02` or none (none is taken as UTC, as the API documents). Not accepted: a date with no time, a space instead of `T`, week or ordinal dates. Fractions finer than 100 ns are truncated.
 - **Duplicates.** An identical repeat of a record is dropped. The same id with different content is an error, because there is no basis for choosing between them.
 - **Ties on `lastUpdated`** go to the lowest id. None exist in the current data.
 - **Money** is `decimal` end to end and is not rounded. Prices have two decimal places, so the sums are exact.
@@ -160,6 +160,8 @@ Why the pieces are split where they are:
 
 ## Known limitations
 
+- **A long rate limit is reported as a timeout.** Five tries with the server's `Retry-After` between them only fit inside the 45 second crawl budget when `Retry-After` is about 10 seconds or less, which is what the live API sends. Against a longer one the caller gets a 504 for the crawl budget, not a 503 carrying the upstream `Retry-After`. Stopping early when the requested wait exceeds the remaining budget would fix that.
+- **An empty dataset is believed.** A 200 that says `totalRecords: 0` is internally consistent, so it is accepted and cached as an empty summary for five minutes.
 - **A dead upstream takes 45 seconds to report.** If the API accepts connections but never answers, callers wait for the whole crawl budget before getting a 504. Checked against an address that hangs. I never got a refused connection in my environment, so the 503 path is proven only by unit tests.
 - **No proactive rate limiting.** The service runs into the 429 and waits, once per crawl, instead of pacing itself to 5 requests per 10 seconds. It works because the API sends an accurate `Retry-After`; it would behave badly against an API that did not.
 - **The cache is per process and in memory.** Two instances would each crawl and would compete for the same rate limit. The first request after start or expiry pays the full 11 seconds; there is no background refresh or stale-while-revalidate.
@@ -170,7 +172,8 @@ Why the pieces are split where they are:
 - **A `Retry-After` longer than the 30 second cap is shortened**, so that retry is likely to be refused again.
 - **Separation of HTTP from business logic is by interface and namespace** within one project, not enforced by separate assemblies.
 - **Not built:** authentication on this service's own endpoint, HTTPS configuration, health checks, OpenAPI, metrics, a circuit breaker, a container image.
-- **Several tests use a real 50 ms timeout** to exercise the per-attempt timeout and the crawl budget, so they depend on wall-clock time and could fail on a badly stalled machine.
+- **A few tests use a real 50 ms timeout** to exercise the per-attempt timeout, which has no injectable clock, so they depend on wall-clock time and could fail on a badly stalled machine.
+- **Jitter is lost at the cap.** A backoff that reaches the 30 second maximum is exactly 30 seconds for every instance.
 - **A crawl nobody is waiting for still runs to the end**, up to its 45 second budget. That is the price of not tying it to one caller.
 
 ## With more time

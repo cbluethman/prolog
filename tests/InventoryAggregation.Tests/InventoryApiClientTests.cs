@@ -30,7 +30,10 @@ public class InventoryApiClientTests
     private readonly List<TimeSpan> _waits = [];
     private readonly ManualTimeProvider _clock = new();
 
-    private IInventoryApiClient CreateClient(Dictionary<string, string?>? settings = null)
+    private IInventoryApiClient CreateClient(Dictionary<string, string?>? settings = null) =>
+        BuildProvider(settings).GetRequiredService<IInventoryApiClient>();
+
+    private ServiceProvider BuildProvider(Dictionary<string, string?>? settings = null)
     {
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -54,7 +57,7 @@ public class InventoryApiClientTests
         services.AddInventoryApiClient();
         services.AddHttpClient(InventoryApiClient.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => _network);
 
-        return services.BuildServiceProvider().GetRequiredService<IInventoryApiClient>();
+        return services.BuildServiceProvider();
     }
 
     private async Task<InventoryUnavailableException> AssertFailsAsync(InventoryFailureReason expected)
@@ -177,9 +180,10 @@ public class InventoryApiClientTests
         });
 
         var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
-            () => client.GetPageAsync(1, 20, CancellationToken.None));
+            () => client.GetPageAsync(1, 20, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Equal(InventoryFailureReason.Timeout, exception.Reason);
+        Assert.IsType<TimeoutException>(exception.InnerException);
     }
 
     [Fact]
@@ -201,6 +205,9 @@ public class InventoryApiClientTests
     [InlineData("{}")]
     [InlineData("""{ "records": null, "page": 1, "totalPages": 1, "totalRecords": 0 }""")]
     [InlineData("""{ "records": [], "page": 1, "totalPages": 1 }""")]
+    [InlineData("""{ "records": [], "totalPages": 1, "totalRecords": 0 }""")]
+    [InlineData("""{ "records": [], "page": 1, "totalRecords": 0 }""")]
+    [InlineData("""{ "records": [], "page": null, "totalPages": null, "totalRecords": null }""")]
     [InlineData("""{ "records": [null], "page": 1, "totalPages": 1, "totalRecords": 1 }""")]
     [InlineData("""{ "records": [{ "id": 1, "price": "not a number" }], "page": 1, "totalPages": 1, "totalRecords": 1 }""")]
     [InlineData("[]")]
@@ -230,21 +237,78 @@ public class InventoryApiClientTests
     [InlineData("InventoryApi:BaseUrl", "ftp://inventory.test")]
     [InlineData("InventoryApi:BaseUrl", "localhost:5000")]
     [InlineData("InventoryApi:BaseUrl", "/srv/inventory")]
+    // Local, but still not http.
+    [InlineData("InventoryApi:BaseUrl", "ftp://localhost")]
     // Plain http to another machine would send the API key in clear text.
     [InlineData("InventoryApi:BaseUrl", "http://inventory.test")]
     // What a key read from a file tends to look like. It cannot be sent as a header value.
     [InlineData("InventoryApi:ApiKey", "test-key\n")]
     [InlineData("InventoryApi:ApiKey", "test key")]
+    // A control character that is not white space.
+    [InlineData("InventoryApi:ApiKey", "test\u0001key")]
+    [InlineData("InventoryApi:AttemptTimeout", "-00:00:01")]
+    [InlineData("InventoryApi:CrawlTimeout", "-00:00:01")]
     [InlineData("InventoryApi:MaxAttempts", "11")]
     [InlineData("InventoryApi:CrawlTimeout", "00:00:00")]
     // A negative wait would be an infinite Task.Delay or an exception inside the retry loop.
     [InlineData("InventoryApi:MaxRetryDelay", "-00:00:00.001")]
     [InlineData("InventoryApi:BaseBackoff", "-00:00:01")]
     [InlineData("InventoryApi:CacheTtl", "-00:00:01")]
+    // Uri.TryCreate trims these, but the address built from the raw value would be broken.
+    [InlineData("InventoryApi:BaseUrl", "https://inventory.test ")]
+    [InlineData("InventoryApi:BaseUrl", "https://inventory.test\n")]
+    // Either would be silently dropped when the request path is appended.
+    [InlineData("InventoryApi:BaseUrl", "https://inventory.test/base?tenant=1")]
+    [InlineData("InventoryApi:BaseUrl", "https://inventory.test/#part")]
+    // Looks fine in an editor; cannot be sent as a header value.
+    [InlineData("InventoryApi:ApiKey", "test-key\u200B")]
+    [InlineData("InventoryApi:ApiKey", "\uFEFFtest-key")]
     public async Task Missing_or_invalid_configuration_is_rejected_with_a_clear_error(string key, string value)
     {
         var exception = await Assert.ThrowsAsync<OptionsValidationException>(
             () => CreateClient(new() { [key] = value }).GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.Contains(key, exception.Message);
+    }
+
+    // Each of these passes validation today and then breaks every request instead: the two timeouts
+    // cannot be scheduled (ArgumentOutOfRangeException, reported as a 502 or a 500), and the TTL
+    // cannot be added to the current time, so a crawl that succeeded still ends in a 500.
+    [Theory]
+    [InlineData("InventoryApi:AttemptTimeout", "50.00:00:00")]
+    [InlineData("InventoryApi:CrawlTimeout", "50.00:00:00")]
+    [InlineData("InventoryApi:CacheTtl", "10675199.02:48:05.4775807")]
+    [InlineData("InventoryApi:MaxRetryDelay", "50.00:00:00")]
+    [InlineData("InventoryApi:BaseBackoff", "50.00:00:00")]
+    public async Task Duration_too_long_to_be_used_is_rejected_at_startup(string key, string value)
+    {
+        var exception = await Assert.ThrowsAsync<OptionsValidationException>(
+            () => CreateClient(new() { [key] = value }).GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.Contains(key, exception.Message);
+    }
+
+    // The real network handler refuses to write the header ("Request headers must contain only ASCII
+    // characters"), which is then retried and reported as the Inventory API being unreachable.
+    [Fact]
+    public async Task Api_key_that_cannot_be_sent_as_a_header_is_rejected_at_startup()
+    {
+        var exception = await Assert.ThrowsAsync<OptionsValidationException>(
+            () => CreateClient(new() { ["InventoryApi:ApiKey"] = "k\u00e9y" }).GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.Contains("InventoryApi:ApiKey", exception.Message);
+    }
+
+    [Theory]
+    [InlineData("InventoryApi:ApiKey")]
+    [InlineData("InventoryApi:BaseUrl")]
+    public void Missing_required_setting_is_reported_at_startup_before_anything_asks_for_the_client(string key)
+    {
+        using var provider = BuildProvider(new() { [key] = "" });
+
+        // What the host runs when it starts.
+        var exception = Assert.Throws<OptionsValidationException>(
+            () => provider.GetRequiredService<IStartupValidator>().Validate());
 
         Assert.Contains(key, exception.Message);
     }
@@ -484,5 +548,97 @@ public class InventoryApiClientTests
 
         Assert.Equal(["test-key", "test-key", "test-key"], _network.ApiKeysSent);
         Assert.Single(_network.RequestUris.Distinct());
+    }
+
+    [Theory]
+    [InlineData("InventoryApi:PageSize", "1")]
+    [InlineData("InventoryApi:PageSize", "25")]
+    [InlineData("InventoryApi:MaxAttempts", "1")]
+    [InlineData("InventoryApi:MaxAttempts", "10")]
+    [InlineData("InventoryApi:BaseBackoff", "00:00:00")]
+    [InlineData("InventoryApi:MaxRetryDelay", "00:00:00")]
+    [InlineData("InventoryApi:CacheTtl", "00:00:00")]
+    public async Task Setting_at_the_edge_of_its_allowed_range_is_accepted(string key, string value)
+    {
+        _network.Respond(HttpStatusCode.OK, OnePage);
+
+        var page = await CreateClient(new() { [key] = value }).GetPageAsync(1, 20, CancellationToken.None);
+
+        Assert.Equal(157, page.TotalRecords);
+    }
+
+    [Fact]
+    public async Task Api_key_is_sent_exactly_as_configured()
+    {
+        const string key = "Sk_Live-AbC123+/==";
+        _network.Respond(HttpStatusCode.OK, OnePage);
+
+        await CreateClient(new() { ["InventoryApi:ApiKey"] = key }).GetPageAsync(1, 20, CancellationToken.None);
+
+        Assert.Equal(key, Assert.Single(_network.ApiKeysSent));
+    }
+
+    [Fact]
+    public void Http_client_has_no_overall_timeout_of_its_own()
+    {
+        using var provider = BuildProvider();
+
+        var http = provider.GetRequiredService<IHttpClientFactory>().CreateClient(InventoryApiClient.HttpClientName);
+
+        // The default 100 seconds would cut across the retries; each attempt has its own limit instead.
+        Assert.Equal(Timeout.InfiniteTimeSpan, http.Timeout);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.RequestTimeout)]
+    [InlineData(HttpStatusCode.BadGateway)]
+    [InlineData(HttpStatusCode.ServiceUnavailable)]
+    [InlineData(HttpStatusCode.GatewayTimeout)]
+    public async Task Any_other_failure_status_is_an_upstream_error_that_names_the_status(HttpStatusCode status)
+    {
+        // Retry-After means something on a 429 only; here it must not make this look like a rate limit.
+        _network.Respond(status, retryAfter: "10");
+        var client = CreateClient(new() { ["InventoryApi:MaxAttempts"] = "1" });
+
+        var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => client.GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.Equal(InventoryFailureReason.UpstreamError, exception.Reason);
+        Assert.Contains($"HTTP {(int)status}", exception.Message);
+        Assert.Null(exception.RetryAfter);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.OK)]
+    [InlineData(HttpStatusCode.NotFound)]
+    public async Task Response_is_released_whether_the_page_was_read_or_refused(HttpStatusCode status)
+    {
+        _network.Respond(status, OnePage);
+
+        await Record.ExceptionAsync(() => CreateClient().GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.True(Assert.Single(_network.Responses).Disposed);
+    }
+
+    [Fact]
+    public async Task Request_cancelled_by_something_other_than_the_caller_is_a_timeout()
+    {
+        // No retry handler here: HttpClient itself can cancel a request the caller is still waiting for.
+        var cancelled = new TaskCanceledException("the request was cancelled");
+        _network.Throw(cancelled);
+        var client = new InventoryApiClient(new SingleClientFactory(_network), _clock);
+
+        var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => client.GetPageAsync(1, 20, CancellationToken.None));
+
+        Assert.Equal(InventoryFailureReason.Timeout, exception.Reason);
+        Assert.Same(cancelled, exception.InnerException);
+    }
+
+    private sealed class SingleClientFactory(HttpMessageHandler network) : IHttpClientFactory
+    {
+        public HttpClient CreateClient(string name) =>
+            new(network, disposeHandler: false) { BaseAddress = new Uri("https://inventory.test/") };
     }
 }

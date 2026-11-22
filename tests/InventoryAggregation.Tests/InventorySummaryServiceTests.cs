@@ -3,6 +3,7 @@ using InventoryAggregation.Api.Domain;
 using InventoryAggregation.Api.Inventory;
 using InventoryAggregation.Tests.Fakes;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace InventoryAggregation.Tests;
@@ -23,7 +24,8 @@ public class InventorySummaryServiceTests
             CrawlTimeout = crawlTimeout ?? TimeSpan.FromSeconds(30),
         }),
         _clock,
-        _lifetime);
+        _lifetime,
+        NullLogger<InventorySummaryService>.Instance);
 
     [Fact]
     public async Task Summary_carries_categories_and_metadata()
@@ -128,6 +130,27 @@ public class InventorySummaryServiceTests
     }
 
     [Fact]
+    public async Task Caller_arriving_while_an_expired_result_is_being_refreshed_waits_for_the_new_one()
+    {
+        var service = CreateService();
+        var expired = await service.GetSummaryAsync(CancellationToken.None);
+        _clock.Now += TimeSpan.FromMinutes(6);
+        _collector.Hold = new TaskCompletionSource();
+        _collector.Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var refreshing = service.GetSummaryAsync(CancellationToken.None);
+        await _collector.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var arrival = service.GetSummaryAsync(CancellationToken.None);
+        var answeredEarly = arrival.IsCompleted;
+        _collector.Hold.SetResult();
+
+        Assert.False(answeredEarly);
+        Assert.Same(await refreshing, await arrival.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.NotSame(expired, await arrival);
+        Assert.Equal(2, _collector.Calls);
+    }
+
+    [Fact]
     public async Task Zero_ttl_collects_on_every_call()
     {
         var service = CreateService(cacheTtl: TimeSpan.Zero);
@@ -147,7 +170,7 @@ public class InventorySummaryServiceTests
 
         var abandoned = service.GetSummaryAsync(impatient.Token);
         await impatient.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned.WaitAsync(TimeSpan.FromSeconds(5)));
 
         // The crawl the impatient caller started is still the one that answers the next caller.
         var patient = service.GetSummaryAsync(CancellationToken.None);
@@ -168,7 +191,7 @@ public class InventorySummaryServiceTests
         var collecting = service.GetSummaryAsync(CancellationToken.None);
         var waiting = service.GetSummaryAsync(impatient.Token);
         await impatient.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting.WaitAsync(TimeSpan.FromSeconds(5)));
 
         _collector.Hold.SetResult();
         var summary = await collecting;
@@ -203,17 +226,66 @@ public class InventorySummaryServiceTests
     [Fact]
     public async Task Crawl_that_exceeds_its_time_budget_is_a_timeout()
     {
-        var service = CreateService(crawlTimeout: TimeSpan.FromMilliseconds(50));
+        var service = CreateService(crawlTimeout: TimeSpan.FromSeconds(30));
         _collector.Hold = new TaskCompletionSource();
 
+        var pending = service.GetSummaryAsync(CancellationToken.None);
+        await _collector.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // No real waiting: the budget is measured on the injected clock.
+        _clock.Now += TimeSpan.FromSeconds(30);
+
         var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
-            () => service.GetSummaryAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+            () => pending.WaitAsync(TimeSpan.FromSeconds(5)));
 
         Assert.Equal(InventoryFailureReason.Timeout, exception.Reason);
+        Assert.Contains("30 seconds", exception.Message);
+        Assert.IsAssignableFrom<OperationCanceledException>(exception.InnerException);
     }
 
     [Fact]
-    public async Task Application_shutdown_stops_the_crawl()
+    public async Task Crawl_that_is_still_inside_its_time_budget_is_left_to_finish()
+    {
+        var service = CreateService(crawlTimeout: TimeSpan.FromSeconds(30));
+        _collector.Hold = new TaskCompletionSource();
+
+        var pending = service.GetSummaryAsync(CancellationToken.None);
+        await _collector.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        _clock.Now += TimeSpan.FromSeconds(30) - TimeSpan.FromTicks(1);
+        _collector.Hold.SetResult();
+
+        Assert.NotNull(await pending.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task Each_crawl_gets_the_whole_time_budget_to_itself()
+    {
+        var service = CreateService(cacheTtl: TimeSpan.Zero, crawlTimeout: TimeSpan.FromSeconds(30));
+
+        // The first crawl is long over when the second starts 29 seconds in.
+        await service.GetSummaryAsync(CancellationToken.None);
+        _clock.Now += TimeSpan.FromSeconds(29);
+        _collector.Hold = new TaskCompletionSource();
+        _collector.Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var second = service.GetSummaryAsync(CancellationToken.None);
+        await _collector.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        _clock.Now += TimeSpan.FromSeconds(29);
+        _collector.Hold.SetResult();
+
+        Assert.NotNull(await second.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task Finished_crawl_leaves_no_deadline_timer_behind()
+    {
+        var service = CreateService();
+
+        await service.GetSummaryAsync(CancellationToken.None);
+
+        Assert.Equal(0, _clock.PendingTimers);
+    }
+
+    [Fact]
+    public async Task Application_shutdown_stops_the_crawl_and_tells_waiting_callers_to_retry()
     {
         var service = CreateService();
         _collector.Hold = new TaskCompletionSource();
@@ -221,7 +293,26 @@ public class InventorySummaryServiceTests
         var pending = service.GetSummaryAsync(CancellationToken.None);
         await _lifetime.Stopping.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(TimeSpan.FromSeconds(5)));
+        // Not a bare cancellation: the caller did not cancel, and the endpoint turns this into a 503.
+        var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => pending.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(InventoryFailureReason.Unreachable, exception.Reason);
+        Assert.Contains("shutting down", exception.Message);
+    }
+
+    [Fact]
+    public async Task Values_too_large_to_total_are_invalid_data_not_a_crash()
+    {
+        _collector.Records =
+        [
+            new(1, "A", "Toys", decimal.MaxValue, 2, _clock.Now.UtcDateTime),
+        ];
+
+        var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => CreateService().GetSummaryAsync(CancellationToken.None));
+
+        Assert.Equal(InventoryFailureReason.InvalidData, exception.Reason);
+        Assert.IsType<OverflowException>(exception.InnerException);
     }
 
     [Fact]
@@ -254,6 +345,10 @@ public class InventorySummaryServiceTests
         public int? OnlyCallThatFails { get; set; }
 
         public TaskCompletionSource? Hold { get; set; }
+
+        /// <summary>Completes once a crawl has reached the collector, so its deadline is already running.</summary>
+        public TaskCompletionSource Entered { get; set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         private int _calls;
 
         public int Calls => Volatile.Read(ref _calls);
@@ -262,6 +357,7 @@ public class InventorySummaryServiceTests
         {
             // Crawls run on the thread pool now, so count safely.
             var call = Interlocked.Increment(ref _calls);
+            Entered.TrySetResult();
 
             if (Hold is not null)
             {

@@ -29,7 +29,8 @@ public sealed class InventorySummaryService(
     IInventoryAggregator aggregator,
     IOptions<InventoryApiOptions> options,
     TimeProvider timeProvider,
-    IHostApplicationLifetime applicationLifetime) : IInventorySummaryService
+    IHostApplicationLifetime applicationLifetime,
+    ILogger<InventorySummaryService> logger) : IInventorySummaryService
 {
     private readonly InventoryApiOptions _options = options.Value;
 
@@ -59,7 +60,17 @@ public sealed class InventorySummaryService(
 
             // Join the crawl in progress, or start one. Task.Run so it starts on its own:
             // not on this caller's request, and never synchronously inside the lock.
-            crawl = _crawlInProgress ??= Task.Run(CrawlAsync);
+            // SuppressFlow: the crawl outlives this request, so it must not inherit the
+            // request's ambient context (its log scope and trace id).
+            if (_crawlInProgress is null)
+            {
+                using (ExecutionContext.SuppressFlow())
+                {
+                    _crawlInProgress = Task.Run(CrawlAsync);
+                }
+            }
+
+            crawl = _crawlInProgress;
         }
 
         // The caller's token ends the caller's wait. It does not end the crawl.
@@ -88,10 +99,32 @@ public sealed class InventorySummaryService(
                     $"The inventory could not be collected within {_options.CrawlTimeout.TotalSeconds:0.#} seconds.",
                     exception);
             }
+            catch (OperationCanceledException exception) when (applicationLifetime.ApplicationStopping.IsCancellationRequested)
+            {
+                // Callers still waiting get a 503 they can retry elsewhere, not a bare cancellation.
+                throw new InventoryUnavailableException(
+                    InventoryFailureReason.Unreachable,
+                    "The service is shutting down.",
+                    exception);
+            }
+
+            IReadOnlyList<CategorySummary> categories;
+            try
+            {
+                categories = aggregator.Aggregate(records);
+            }
+            catch (OverflowException exception)
+            {
+                // Valid-looking but absurd numbers: price x quantity no longer fits in a decimal.
+                throw new InventoryUnavailableException(
+                    InventoryFailureReason.InvalidData,
+                    "The Inventory API returned prices and quantities too large to total.",
+                    exception);
+            }
 
             var now = timeProvider.GetUtcNow();
             var summary = new InventorySummary(
-                aggregator.Aggregate(records),
+                categories,
                 new SummaryMetadata(
                     RecordsRetrieved: records.Count,
                     ZeroQuantityExcluded: records.Count(record => !InventoryAggregator.IsAvailable(record)),
@@ -101,6 +134,13 @@ public sealed class InventorySummaryService(
             // moment at which a new caller sees neither and starts a second crawl.
             _cache = new CacheEntry(summary, ExpiresAt: now + _options.CacheTtl);
             return summary;
+        }
+        catch (Exception exception)
+        {
+            // Logged here, once per crawl, because the callers may all have gone by now
+            // and then nobody else would ever report why it failed.
+            logger.LogError(exception, "Inventory crawl failed");
+            throw;
         }
         finally
         {
