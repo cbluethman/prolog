@@ -118,31 +118,68 @@ public class InventoryCollectorTests
         Assert.Equal([1], client.RequestedPages);
     }
 
+    /// <summary>Each invalid record, with a fragment of the message that names the rule it broke.</summary>
     public static TheoryData<string, InventoryPageRecord> InvalidRecords => new()
     {
-        { "missing id", Record(1) with { Id = null } },
-        { "zero id", Record(1) with { Id = 0 } },
-        { "missing name", Record(1) with { Name = null } },
-        { "blank name", Record(1) with { Name = "  " } },
-        { "missing category", Record(1) with { Category = null } },
-        { "blank category", Record(1) with { Category = " " } },
-        { "missing price", Record(1) with { Price = null } },
+        { "non-positive id", Record(1) with { Id = null } },
+        { "non-positive id", Record(1) with { Id = 0 } },
+        { "non-positive id", Record(1) with { Id = -1 } },
+        { "has no name", Record(1) with { Name = null } },
+        { "has no name", Record(1) with { Name = "  " } },
+        { "has no category", Record(1) with { Category = null } },
+        { "has no category", Record(1) with { Category = " " } },
+        { "negative price", Record(1) with { Price = null } },
         { "negative price", Record(1) with { Price = -0.01m } },
-        { "missing quantity", Record(1) with { Quantity = null } },
+        { "negative quantity", Record(1) with { Quantity = null } },
         { "negative quantity", Record(1) with { Quantity = -1 } },
-        { "missing lastUpdated", Record(1) with { LastUpdated = null } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = null } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "" } },
         { "unreadable lastUpdated", Record(1) with { LastUpdated = "yesterday" } },
+        // Not ISO 8601. A lenient parser accepts all of these, and turns "12:30" into today's date.
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "12:30" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "Oct 15" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "10/15/2026" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-10-15" } },
+        { "unreadable lastUpdated", Record(1) with { LastUpdated = "2026-13-45T12:30:00Z" } },
     };
 
     [Theory]
     [MemberData(nameof(InvalidRecords))]
-    public async Task Invalid_record_fails_the_whole_collection(string reason, InventoryPageRecord invalid)
+    public async Task Invalid_record_fails_the_whole_collection(string brokenRule, InventoryPageRecord invalid)
     {
-        Assert.NotEmpty(reason);
         var client = new FakeInventoryApiClient()
             .WithPage(1, totalPages: 1, totalRecords: 2, invalid, Record(2));
 
-        await AssertInvalidDataAsync(client);
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.Contains(brokenRule, exception.Message);
+    }
+
+    [Theory]
+    [InlineData("2026-10-15T12:30:00Z")]
+    [InlineData("2026-10-15T12:30:00.5Z")]
+    [InlineData("2026-10-15T12:30:00.1234567Z")]
+    [InlineData("2026-10-15T14:30:00+02:00")]
+    [InlineData("2026-10-15T12:30:00")]
+    public async Task Iso_8601_last_updated_is_accepted_in_each_of_its_forms(string lastUpdated)
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 1, Record(1, lastUpdated: lastUpdated));
+
+        var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+        Assert.Equal(new DateTime(2026, 10, 15, 12, 30, 0, DateTimeKind.Utc), record.LastUpdated.AddTicks(-(record.LastUpdated.Ticks % TimeSpan.TicksPerSecond)));
+    }
+
+    [Fact]
+    public async Task Oversized_upstream_value_is_cut_short_in_the_error_message()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 1, Record(1) with { LastUpdated = new string('x', 5000) });
+
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.InRange(exception.Message.Length, 1, 200);
     }
 
     [Fact]
@@ -186,5 +223,183 @@ public class InventoryCollectorTests
             () => CollectorFor(client).CollectAllAsync(CancellationToken.None));
 
         Assert.Same(failure, thrown);
+    }
+
+    [Fact]
+    public async Task Every_page_is_requested_with_the_configured_page_size()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 2, totalRecords: 3, Record(1), Record(2))
+            .WithPage(2, totalPages: 2, totalRecords: 3, Record(3));
+
+        await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([2, 2], client.RequestedPageSizes);
+    }
+
+    [Fact]
+    public async Task Single_page_dataset_never_requests_a_second_page()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 2, Record(1), Record(2))
+            // Past the end. Asking for it would spend a request and break the count.
+            .WithPage(2, totalPages: 1, totalRecords: 2, Record(3));
+
+        var records = await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([1, 2], records.Select(record => record.Id));
+        Assert.Equal([1], client.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Empty_page_in_the_middle_is_accepted_when_the_unique_count_still_matches()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 3, totalRecords: 3, Record(1), Record(2))
+            .WithPage(2, totalPages: 3, totalRecords: 3)
+            .WithPage(3, totalPages: 3, totalRecords: 3, Record(3));
+
+        var records = await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([1, 2, 3], records.Select(record => record.Id));
+        Assert.Equal([1, 2, 3], client.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Record_repeated_within_one_page_is_kept_once()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 2, Record(1), Record(1), Record(2));
+
+        var records = await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([1, 2], records.Select(record => record.Id));
+    }
+
+    [Fact]
+    public async Task Same_id_with_different_content_within_one_page_is_rejected()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 1, Record(1, quantity: 1), Record(1, quantity: 2));
+
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.Contains("Record 1", exception.Message);
+    }
+
+    [Fact]
+    public async Task Repeat_that_differs_only_in_how_its_values_are_written_is_the_same_record()
+    {
+        // Same instant and same amount, spelled differently.
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 2, totalRecords: 1, Record(1, price: 1.5m, lastUpdated: "2026-09-01T00:00:00Z"))
+            .WithPage(2, totalPages: 2, totalRecords: 1, Record(1, price: 1.50m, lastUpdated: "2026-09-01T02:00:00+02:00"));
+
+        var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+        Assert.Equal(1, record.Id);
+    }
+
+    [Theory]
+    [InlineData(-1, 0)]
+    [InlineData(1, -1)]
+    [InlineData(10_001, 0)]
+    public async Task Nonsensical_totals_on_the_first_page_are_rejected_without_crawling(int totalPages, int totalRecords)
+    {
+        var client = new FakeInventoryApiClient().WithPage(1, totalPages, totalRecords);
+
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.Contains($"totalPages = {totalPages}, totalRecords = {totalRecords}", exception.Message);
+        Assert.Equal([1], client.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Total_pages_changing_between_pages_is_rejected()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 2, totalRecords: 3, Record(1), Record(2))
+            .WithPage(2, totalPages: 3, totalRecords: 3, Record(3));
+
+        var exception = await AssertInvalidDataAsync(client);
+
+        Assert.Contains("changed mid-crawl", exception.Message);
+    }
+
+    [Fact]
+    public async Task Failure_on_a_later_page_fails_the_whole_collection()
+    {
+        var failure = new InventoryUnavailableException(InventoryFailureReason.RateLimited, "still throttled");
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 3, totalRecords: 5, Record(1), Record(2))
+            .WithPage(2, totalPages: 3, totalRecords: 5, Record(3), Record(4))
+            .FailingOnPage(3, failure);
+
+        var thrown = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+        Assert.Same(failure, thrown);
+    }
+
+    [Fact]
+    public async Task Cancellation_between_pages_stops_the_crawl()
+    {
+        using var caller = new CancellationTokenSource();
+        var client = new FakeInventoryApiClient
+        {
+            AfterRequest = page =>
+            {
+                if (page == 2)
+                {
+                    caller.Cancel();
+                }
+            },
+        };
+        client
+            .WithPage(1, totalPages: 4, totalRecords: 4, Record(1))
+            .WithPage(2, totalPages: 4, totalRecords: 4, Record(2))
+            .WithPage(3, totalPages: 4, totalRecords: 4, Record(3))
+            .WithPage(4, totalPages: 4, totalRecords: 4, Record(4));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => CollectorFor(client).CollectAllAsync(caller.Token));
+
+        Assert.Equal([1, 2], client.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Last_updated_without_an_offset_is_taken_as_utc()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 1, Record(1, lastUpdated: "2026-10-15T12:30:00"));
+
+        var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+        Assert.Equal(new DateTime(2026, 10, 15, 12, 30, 0, DateTimeKind.Utc), record.LastUpdated);
+        Assert.Equal(DateTimeKind.Utc, record.LastUpdated.Kind);
+    }
+
+    [Fact]
+    public async Task Records_are_returned_in_id_order_whatever_order_the_pages_use()
+    {
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 2, totalRecords: 4, Record(9), Record(4))
+            .WithPage(2, totalPages: 2, totalRecords: 4, Record(7), Record(1));
+
+        var records = await CollectorFor(client).CollectAllAsync(CancellationToken.None);
+
+        Assert.Equal([1, 4, 7, 9], records.Select(record => record.Id));
+    }
+
+    [Fact]
+    public async Task Category_is_passed_on_exactly_as_received()
+    {
+        // Normalising it is the aggregator's rule, not the collector's.
+        var client = new FakeInventoryApiClient()
+            .WithPage(1, totalPages: 1, totalRecords: 1, Record(1, category: "  home &  KITCHEN "));
+
+        var record = Assert.Single(await CollectorFor(client).CollectAllAsync(CancellationToken.None));
+
+        Assert.Equal("  home &  KITCHEN ", record.Category);
     }
 }

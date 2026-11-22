@@ -17,7 +17,7 @@ public sealed class InventoryAggregator : IInventoryAggregator
     {
         return records
             // Rule 1: zero-quantity records are not available stock and contribute to nothing.
-            .Where(record => record.Quantity != 0)
+            .Where(IsAvailable)
             // Rule 2: group by category. The upstream data spells the same category several
             // ways ("Toys", " toys ", "TOYS"), so group on a normalised, case-insensitive key.
             .GroupBy(record => NormalizeCategory(record.Category), StringComparer.OrdinalIgnoreCase)
@@ -25,6 +25,12 @@ public sealed class InventoryAggregator : IInventoryAggregator
             .OrderBy(summary => summary.Category, StringComparer.Ordinal)
             .ToList();
     }
+
+    /// <summary>
+    /// The one definition of "available stock". Zero is what the rule names; anything
+    /// below zero is not stock either, so this function is safe on unvalidated input.
+    /// </summary>
+    public static bool IsAvailable(InventoryRecord record) => record.Quantity > 0;
 
     private static CategorySummary Summarize(string categoryKey, IEnumerable<InventoryRecord> group)
     {

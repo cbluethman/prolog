@@ -25,6 +25,16 @@ public sealed class InventoryCollector(
     /// <summary>Runaway guard: refuse to follow a nonsensical totalPages.</summary>
     private const int MaxPages = 10_000;
 
+    /// <summary>
+    /// ISO 8601 date and time, with or without fractional seconds. "K" is the offset:
+    /// "Z", "+02:00", or absent, in which case the value is taken to be UTC as the API documents.
+    /// </summary>
+    private static readonly string[] Iso8601Formats =
+    [
+        "yyyy-MM-dd'T'HH:mm:ssK",
+        "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK",
+    ];
+
     private readonly int _pageSize = options.Value.PageSize;
 
     public async Task<IReadOnlyList<InventoryRecord>> CollectAllAsync(CancellationToken cancellationToken)
@@ -134,9 +144,11 @@ public sealed class InventoryCollector(
             throw Invalid($"Record {id} has a missing or negative quantity ({Show(raw.Quantity)}).");
         }
 
-        // The API documents ISO 8601 in UTC. A value with no offset is taken to be UTC.
-        if (!DateTimeOffset.TryParse(
+        // Exact formats only. A lenient parse would accept "12:30" and invent today's date,
+        // and an invented date could win "most recently updated".
+        if (!DateTimeOffset.TryParseExact(
                 raw.LastUpdated,
+                Iso8601Formats,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal,
                 out var lastUpdated))
@@ -147,7 +159,18 @@ public sealed class InventoryCollector(
         return new InventoryRecord(id, raw.Name, raw.Category, raw.Price.Value, raw.Quantity.Value, lastUpdated.UtcDateTime);
     }
 
-    private static string Show(object? value) => value is null ? "null" : $"'{value}'";
+    /// <summary>Quotes an upstream value for an error message, cut short so a huge value cannot flood it.</summary>
+    private static string Show(object? value)
+    {
+        const int maxLength = 40;
+
+        if (value?.ToString() is not { } text)
+        {
+            return "null";
+        }
+
+        return text.Length <= maxLength ? $"'{text}'" : $"'{text[..maxLength]}...'";
+    }
 
     private static InventoryUnavailableException Invalid(string message) =>
         new(InventoryFailureReason.InvalidData, message);

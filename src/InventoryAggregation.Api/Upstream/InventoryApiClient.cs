@@ -6,11 +6,12 @@ namespace InventoryAggregation.Api.Upstream;
 
 /// <summary>
 /// The only class that knows the inventory lives behind HTTP and JSON.
-/// Every way a request can fail leaves here as an <see cref="InventoryUnavailableException"/>.
+/// Every way a request can fail leaves here as an <see cref="InventoryUnavailableException"/>;
+/// the only other exception that can leave is the caller's own cancellation.
 /// Retries have already happened by then: they live in <see cref="RetryHandler"/>,
 /// which is part of the named HttpClient's pipeline.
 /// </summary>
-public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : IInventoryApiClient
+public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory, TimeProvider timeProvider) : IInventoryApiClient
 {
     public const string HttpClientName = "InventoryApi";
 
@@ -22,10 +23,25 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : I
         // recycles the underlying connection handlers.
         var http = httpClientFactory.CreateClient(HttpClientName);
 
-        HttpResponseMessage response;
         try
         {
-            response = await http.GetAsync($"api/records?page={page}&pageSize={pageSize}", cancellationToken);
+            using var response = await http.GetAsync($"api/records?page={page}&pageSize={pageSize}", cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw FailureFor(response, page);
+            }
+
+            return await ReadPageAsync(response, page, cancellationToken);
+        }
+        catch (InventoryUnavailableException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The caller gave up. That is not a failure of the Inventory API.
+            throw;
         }
         catch (HttpRequestException exception)
         {
@@ -36,29 +52,25 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : I
                 $"Could not reach the Inventory API for page {page}.",
                 exception);
         }
-        catch (Exception exception) when (
-            exception is TimeoutException ||
-            (exception is OperationCanceledException && !cancellationToken.IsCancellationRequested))
+        catch (Exception exception) when (exception is TimeoutException or OperationCanceledException)
         {
             throw new InventoryUnavailableException(
                 InventoryFailureReason.Timeout,
                 $"The Inventory API did not respond in time for page {page}.",
                 exception);
         }
-
-        using (response)
+        catch (Exception exception)
         {
-            if (!response.IsSuccessStatusCode)
-            {
-                throw FailureFor(response, page);
-            }
-
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
-            return ParsePage(body, page);
+            // Nothing specific is expected here. This keeps the promise in the class summary:
+            // whatever went wrong while talking to the API, callers handle one exception type.
+            throw new InventoryUnavailableException(
+                InventoryFailureReason.UpstreamError,
+                $"The request to the Inventory API for page {page} failed unexpectedly.",
+                exception);
         }
     }
 
-    private static InventoryUnavailableException FailureFor(HttpResponseMessage response, int page)
+    private InventoryUnavailableException FailureFor(HttpResponseMessage response, int page)
     {
         var status = (int)response.StatusCode;
 
@@ -71,7 +83,7 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : I
             HttpStatusCode.TooManyRequests => new InventoryUnavailableException(
                 InventoryFailureReason.RateLimited,
                 $"The Inventory API is still rate limiting this service after retries (page {page}).",
-                retryAfter: response.Headers.RetryAfter?.Delta),
+                retryAfter: RetryAfter(response)),
 
             _ => new InventoryUnavailableException(
                 InventoryFailureReason.UpstreamError,
@@ -79,16 +91,39 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : I
         };
     }
 
+    /// <summary>Retry-After as a duration, whether the server sent seconds or an HTTP date.</summary>
+    private TimeSpan? RetryAfter(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+
+        if (retryAfter?.Delta is { } seconds)
+        {
+            return seconds;
+        }
+
+        if (retryAfter?.Date is { } date)
+        {
+            var remaining = date - timeProvider.GetUtcNow();
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// A 200 is not a guarantee. This checks the envelope is structurally complete;
     /// whether the records make sense is the collector's job.
     /// </summary>
-    private static InventoryPage ParsePage(string body, int page)
+    private static async Task<InventoryPage> ReadPageAsync(
+        HttpResponseMessage response, int page, CancellationToken cancellationToken)
     {
         PageDto? dto;
         try
         {
-            dto = JsonSerializer.Deserialize<PageDto>(body, JsonOptions);
+            // Read as a stream of bytes (JSON is UTF-8), not as a string: decoding to a string
+            // first would trust the Content-Type charset, and an unknown charset throws.
+            await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
+            dto = await JsonSerializer.DeserializeAsync<PageDto>(body, JsonOptions, cancellationToken);
         }
         catch (JsonException exception)
         {

@@ -17,7 +17,11 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
 
     public int RequestCount => RequestUris.Count;
 
-    public ScriptedHttpHandler Respond(HttpStatusCode status, string body = "", string? retryAfter = null)
+    /// <summary>Responses made by <see cref="RespondWithBrokenBody"/>, so a test can check they were released.</summary>
+    public List<TrackedResponse> Responses { get; } = [];
+
+    public ScriptedHttpHandler Respond(
+        HttpStatusCode status, string body = "", string? retryAfter = null, string? location = null, string? contentType = null)
     {
         _steps.Enqueue(_ =>
         {
@@ -31,8 +35,45 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
                 response.Headers.TryAddWithoutValidation("Retry-After", retryAfter);
             }
 
+            if (location is not null)
+            {
+                response.Headers.Location = new Uri(location);
+            }
+
+            if (contentType is not null)
+            {
+                // Set raw, so a test can send a Content-Type the framework itself would refuse to build.
+                response.Content.Headers.Remove("Content-Type");
+                response.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
+            }
+
             return Task.FromResult(response);
         });
+        return this;
+    }
+
+    /// <summary>Headers arrive, then the connection drops while the body is being read.</summary>
+    public ScriptedHttpHandler RespondWithBrokenBody(HttpStatusCode status)
+    {
+        _steps.Enqueue(_ =>
+        {
+            var response = new TrackedResponse(status)
+            {
+                Content = new ScriptedBody(_ => Task.FromException(new IOException("connection reset mid-body"))),
+            };
+            Responses.Add(response);
+            return Task.FromResult<HttpResponseMessage>(response);
+        });
+        return this;
+    }
+
+    /// <summary>Headers arrive, then the body never does; reading ends only when cancelled.</summary>
+    public ScriptedHttpHandler RespondWithStalledBody(HttpStatusCode status)
+    {
+        _steps.Enqueue(_ => Task.FromResult(new HttpResponseMessage(status)
+        {
+            Content = new ScriptedBody(cancellationToken => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)),
+        }));
         return this;
     }
 
@@ -62,5 +103,32 @@ public sealed class ScriptedHttpHandler : HttpMessageHandler
         return _steps.TryDequeue(out var step)
             ? step(cancellationToken)
             : throw new InvalidOperationException($"Unscripted request number {RequestCount} to {request.RequestUri}.");
+    }
+
+    public sealed class TrackedResponse(HttpStatusCode status) : HttpResponseMessage(status)
+    {
+        public bool Disposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class ScriptedBody(Func<CancellationToken, Task> read) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            read(CancellationToken.None);
+
+        protected override Task SerializeToStreamAsync(
+            Stream stream, TransportContext? context, CancellationToken cancellationToken) =>
+            read(cancellationToken);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
     }
 }

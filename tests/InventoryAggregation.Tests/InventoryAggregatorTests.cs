@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json;
 using InventoryAggregation.Api.Domain;
 
 namespace InventoryAggregation.Tests;
@@ -30,6 +32,21 @@ public class InventoryAggregatorTests
         Assert.Equal(20.00m, toys.TotalInventoryValue);
         Assert.Equal(1, toys.AvailableRecordCount);
         Assert.Equal(1, toys.MostRecentlyUpdated.Id);
+        Assert.Equal([1], toys.Items.Select(item => item.Id));
+    }
+
+    [Fact]
+    public void Negative_quantity_is_not_available_stock_either()
+    {
+        // The collector rejects negative quantities, but the rule must hold without it.
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Toys", price: 10.00m, quantity: 2),
+            Record(2, "Toys", price: 10.00m, quantity: -5),
+        ]);
+
+        var toys = Assert.Single(result);
+        Assert.Equal(20.00m, toys.TotalInventoryValue);
         Assert.Equal([1], toys.Items.Select(item => item.Id));
     }
 
@@ -133,5 +150,152 @@ public class InventoryAggregatorTests
         ]);
 
         Assert.Equal(["Electronics", "Outdoor", "Toys"], result.Select(category => category.Category));
+    }
+
+    [Theory]
+    [InlineData("Home\t&\tKitchen")]
+    [InlineData("Home\n&\r\nKitchen")]
+    [InlineData("\tHome & Kitchen\r\n")]
+    [InlineData("Home & Kitchen")]
+    public void Tabs_line_breaks_and_non_breaking_spaces_count_as_spacing(string variant)
+    {
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Home & Kitchen"),
+            Record(2, variant),
+        ]);
+
+        var category = Assert.Single(result);
+        Assert.Equal("Home & Kitchen", category.Category);
+        Assert.Equal(2, category.AvailableRecordCount);
+    }
+
+    [Fact]
+    public void Categories_that_differ_by_more_than_spacing_and_case_stay_separate()
+    {
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Home & Kitchen"),
+            // No space to collapse: a different string, so a different category.
+            Record(2, "Home&Kitchen"),
+            Record(3, "Home and Kitchen"),
+            Record(4, "Home"),
+        ]);
+
+        Assert.Equal(4, result.Count);
+        Assert.All(result, category => Assert.Equal(1, category.AvailableRecordCount));
+    }
+
+    [Fact]
+    public void Grouping_does_not_depend_on_the_culture_of_the_machine()
+    {
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            // In Turkish, upper-case I and lower-case i are not a case pair.
+            CultureInfo.CurrentCulture = new CultureInfo("tr-TR");
+
+            var result = _aggregator.Aggregate(
+            [
+                Record(1, "KITCHEN"),
+                Record(2, "kitchen"),
+            ]);
+
+            var category = Assert.Single(result);
+            Assert.Equal("Kitchen", category.Category);
+            Assert.Equal(2, category.AvailableRecordCount);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
+    }
+
+    [Fact]
+    public void Each_category_is_summarised_from_its_own_records_only()
+    {
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Toys", price: 2.00m, quantity: 3, lastUpdated: "2026-09-05T00:00:00Z"),
+            Record(2, "Outdoor", price: 10.00m, quantity: 1, lastUpdated: "2026-09-09T00:00:00Z"),
+            Record(3, "toys", price: 0.50m, quantity: 4, lastUpdated: "2026-09-01T00:00:00Z"),
+            Record(4, "Outdoor", price: 7.25m, quantity: 2, lastUpdated: "2026-09-02T00:00:00Z"),
+        ]);
+
+        Assert.Equal(2, result.Count);
+
+        var outdoor = result[0];
+        Assert.Equal(24.50m, outdoor.TotalInventoryValue);
+        Assert.Equal(2, outdoor.MostRecentlyUpdated.Id);
+        Assert.Equal([2, 4], outdoor.Items.Select(item => item.Id));
+
+        var toys = result[1];
+        Assert.Equal(8.00m, toys.TotalInventoryValue);
+        Assert.Equal(1, toys.MostRecentlyUpdated.Id);
+        Assert.Equal([1, 3], toys.Items.Select(item => item.Id));
+    }
+
+    [Fact]
+    public void Result_does_not_depend_on_the_order_of_the_input()
+    {
+        InventoryRecord[] records =
+        [
+            Record(5, "Toys", price: 2.00m, quantity: 3, lastUpdated: "2026-09-05T00:00:00Z"),
+            Record(2, " OUTDOOR", price: 10.00m, quantity: 1, lastUpdated: "2026-09-09T00:00:00Z"),
+            Record(9, "toys", price: 0.50m, quantity: 4, lastUpdated: "2026-09-05T00:00:00Z"),
+            Record(4, "Outdoor", price: 7.25m, quantity: 2, lastUpdated: "2026-09-09T00:00:00Z"),
+            Record(7, "Electronics", price: 99.99m, quantity: 0),
+            Record(1, "electronics", price: 149.99m, quantity: 12),
+        ];
+        var expected = JsonSerializer.Serialize(_aggregator.Aggregate(records));
+
+        var reversed = JsonSerializer.Serialize(_aggregator.Aggregate(records.Reverse()));
+        var byId = JsonSerializer.Serialize(_aggregator.Aggregate(records.OrderBy(record => record.Id)));
+
+        Assert.Equal(expected, reversed);
+        Assert.Equal(expected, byId);
+    }
+
+    [Fact]
+    public void Input_is_left_as_it_was_given()
+    {
+        List<InventoryRecord> records =
+        [
+            Record(3, " toys ", quantity: 2),
+            Record(1, "Toys", quantity: 0),
+            Record(2, "TOYS"),
+        ];
+        var before = records.ToList();
+
+        _aggregator.Aggregate(records);
+
+        Assert.Equal(before, records);
+    }
+
+    [Fact]
+    public void Fractions_of_a_cent_are_summed_without_rounding()
+    {
+        var result = _aggregator.Aggregate(
+        [
+            Record(1, "Hardware", price: 0.333m, quantity: 3),
+            Record(2, "Hardware", price: 0.0001m, quantity: 1),
+        ]);
+
+        Assert.Equal(0.9991m, Assert.Single(result).TotalInventoryValue);
+    }
+
+    [Fact]
+    public void Items_carry_every_field_of_the_record_unchanged()
+    {
+        var lastUpdated = new DateTime(2026, 10, 15, 12, 30, 0, DateTimeKind.Utc);
+
+        var result = _aggregator.Aggregate(
+        [
+            new InventoryRecord(1001, "Thermal Receipt Printer", " electronics ", 149.99m, 12, lastUpdated),
+        ]);
+
+        Assert.Equal(
+            new CategoryItem(1001, "Thermal Receipt Printer", 149.99m, 12, lastUpdated),
+            Assert.Single(Assert.Single(result).Items));
     }
 }

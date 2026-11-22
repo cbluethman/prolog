@@ -10,7 +10,7 @@ public delegate Task RetryDelay(TimeSpan delay, CancellationToken cancellationTo
 /// The only place that retries. Sits in the HttpClient pipeline, so the client
 /// above it sees one logical request that either works or finally fails.
 ///
-/// Retried:     transport errors, a try that exceeds the per-attempt timeout, 408, 429, 5xx.
+/// Retried:     transport errors, a try that exceeds the per-attempt timeout, 408, 429, 500, 502, 503, 504.
 /// Not retried: every other status (400, 401, 403, 404 ...), because asking again cannot change the answer,
 ///              and cancellation by the caller.
 /// </summary>
@@ -63,12 +63,20 @@ public sealed class RetryHandler(
                     // The caller did not cancel, so it was our per-attempt timeout.
                     if (isLastAttempt)
                     {
+                        response?.Dispose();
                         throw new TimeoutException(
                             $"No response within {_options.AttemptTimeout.TotalSeconds:0.#} s on any of {attempt} attempts.",
                             exception);
                     }
 
                     failure = $"no response within {_options.AttemptTimeout.TotalSeconds:0.#} s";
+                }
+                catch
+                {
+                    // Leaving for good (last transport error, or the caller cancelled):
+                    // headers may have arrived before the body failed, so release the response.
+                    response?.Dispose();
+                    throw;
                 }
             }
 
@@ -83,28 +91,34 @@ public sealed class RetryHandler(
         }
     }
 
-    private static bool IsTransient(HttpStatusCode status) =>
-        status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)status >= 500;
+    /// <summary>Statuses where the same request may succeed later. 501 and 505, for example, never will.</summary>
+    private static bool IsTransient(HttpStatusCode status) => status is
+        HttpStatusCode.RequestTimeout or
+        HttpStatusCode.TooManyRequests or
+        HttpStatusCode.InternalServerError or
+        HttpStatusCode.BadGateway or
+        HttpStatusCode.ServiceUnavailable or
+        HttpStatusCode.GatewayTimeout;
 
     private TimeSpan NextDelay(HttpResponseMessage? response, int attempt)
     {
-        TimeSpan wait;
+        double waitMs;
 
         if (ServerRequestedDelay(response) is { } requested)
         {
             // The server told us when to come back (the live API does this on 429). Believe it.
-            wait = (requested > TimeSpan.Zero ? requested : TimeSpan.Zero) + RetryAfterPadding;
+            waitMs = Math.Max(requested.TotalMilliseconds, 0) + RetryAfterPadding.TotalMilliseconds;
         }
         else
         {
             // Exponential backoff: base, 2x base, 4x base ... plus jitter so that several
             // instances that failed together do not all retry at the same instant.
-            var backoff = _options.BaseBackoff * Math.Pow(2, attempt - 1);
-            var jitter = _options.BaseBackoff * (Random.Shared.NextDouble() / 2);
-            wait = backoff + jitter;
+            var baseMs = _options.BaseBackoff.TotalMilliseconds;
+            waitMs = baseMs * Math.Pow(2, attempt - 1) + baseMs * (Random.Shared.NextDouble() / 2);
         }
 
-        return wait > _options.MaxRetryDelay ? _options.MaxRetryDelay : wait;
+        // Capped while still a plain number, so a large attempt count cannot overflow TimeSpan.
+        return TimeSpan.FromMilliseconds(Math.Min(waitMs, _options.MaxRetryDelay.TotalMilliseconds));
     }
 
     /// <summary>Retry-After can be a number of seconds or an HTTP date.</summary>

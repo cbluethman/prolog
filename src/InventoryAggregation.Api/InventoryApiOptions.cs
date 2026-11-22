@@ -28,6 +28,9 @@ public sealed class InventoryApiOptions
     /// <summary>Upper bound on any single wait between tries, including a server-supplied Retry-After.</summary>
     public TimeSpan MaxRetryDelay { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>Time budget for one whole crawl of every page, including all retries and waits.</summary>
+    public TimeSpan CrawlTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
     /// <summary>How long a successfully built summary is reused before the upstream API is crawled again.</summary>
     public TimeSpan CacheTtl { get; set; } = TimeSpan.FromMinutes(5);
 }

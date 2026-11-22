@@ -12,6 +12,13 @@ public sealed class FakeInventoryApiClient : IInventoryApiClient
 
     public List<int> RequestedPages { get; } = [];
 
+    public List<int> RequestedPageSizes { get; } = [];
+
+    /// <summary>Runs after a page has been requested and before it is answered.</summary>
+    public Action<int>? AfterRequest { get; set; }
+
+    private readonly Dictionary<int, Exception> _failuresByPage = [];
+
     public FakeInventoryApiClient WithPage(
         int page, int totalPages, int totalRecords, params InventoryPageRecord[] records)
     {
@@ -25,13 +32,30 @@ public sealed class FakeInventoryApiClient : IInventoryApiClient
         return this;
     }
 
+    /// <summary>Only this page fails; the others are served as scripted.</summary>
+    public FakeInventoryApiClient FailingOnPage(int page, Exception failure)
+    {
+        _failuresByPage[page] = failure;
+        return this;
+    }
+
     public Task<InventoryPage> GetPageAsync(int page, int pageSize, CancellationToken cancellationToken)
     {
+        // Like the real client: a cancelled caller gets no page.
+        cancellationToken.ThrowIfCancellationRequested();
+
         RequestedPages.Add(page);
+        RequestedPageSizes.Add(pageSize);
+        AfterRequest?.Invoke(page);
 
         if (Failure is not null)
         {
             throw Failure;
+        }
+
+        if (_failuresByPage.TryGetValue(page, out var failure))
+        {
+            throw failure;
         }
 
         return Task.FromResult(_pages[page]);

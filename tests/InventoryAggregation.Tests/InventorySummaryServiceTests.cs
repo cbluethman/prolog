@@ -1,6 +1,8 @@
 using InventoryAggregation.Api;
 using InventoryAggregation.Api.Domain;
 using InventoryAggregation.Api.Inventory;
+using InventoryAggregation.Tests.Fakes;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
 namespace InventoryAggregation.Tests;
@@ -10,11 +12,18 @@ public class InventorySummaryServiceTests
     private readonly StubCollector _collector = new();
     private readonly ManualTimeProvider _clock = new();
 
-    private InventorySummaryService CreateService() => new(
+    private readonly StubLifetime _lifetime = new();
+
+    private InventorySummaryService CreateService(TimeSpan? cacheTtl = null, TimeSpan? crawlTimeout = null) => new(
         _collector,
         new InventoryAggregator(),
-        Options.Create(new InventoryApiOptions { CacheTtl = TimeSpan.FromMinutes(5) }),
-        _clock);
+        Options.Create(new InventoryApiOptions
+        {
+            CacheTtl = cacheTtl ?? TimeSpan.FromMinutes(5),
+            CrawlTimeout = crawlTimeout ?? TimeSpan.FromSeconds(30),
+        }),
+        _clock,
+        _lifetime);
 
     [Fact]
     public async Task Summary_carries_categories_and_metadata()
@@ -88,30 +97,180 @@ public class InventorySummaryServiceTests
         Assert.All(summaries, summary => Assert.Same(summaries[0], summary));
     }
 
+    [Theory]
+    [InlineData(-1, 1)]
+    [InlineData(0, 2)]
+    public async Task Cached_result_is_reused_right_up_to_the_ttl_and_not_at_it(int ticksFromExpiry, int expectedCollections)
+    {
+        var service = CreateService();
+
+        await service.GetSummaryAsync(CancellationToken.None);
+        _clock.Now += TimeSpan.FromMinutes(5) + TimeSpan.FromTicks(ticksFromExpiry);
+        await service.GetSummaryAsync(CancellationToken.None);
+
+        Assert.Equal(expectedCollections, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Ttl_is_counted_from_the_latest_collection()
+    {
+        var service = CreateService();
+
+        await service.GetSummaryAsync(CancellationToken.None);
+        _clock.Now += TimeSpan.FromMinutes(6);
+        var refreshed = await service.GetSummaryAsync(CancellationToken.None);
+        // 10 minutes after the first collection, 4 after the second.
+        _clock.Now += TimeSpan.FromMinutes(4);
+        var later = await service.GetSummaryAsync(CancellationToken.None);
+
+        Assert.Same(refreshed, later);
+        Assert.Equal(2, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Zero_ttl_collects_on_every_call()
+    {
+        var service = CreateService(cacheTtl: TimeSpan.Zero);
+
+        await service.GetSummaryAsync(CancellationToken.None);
+        await service.GetSummaryAsync(CancellationToken.None);
+
+        Assert.Equal(2, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Caller_that_gives_up_does_not_stop_the_crawl()
+    {
+        var service = CreateService();
+        using var impatient = new CancellationTokenSource();
+        _collector.Hold = new TaskCompletionSource();
+
+        var abandoned = service.GetSummaryAsync(impatient.Token);
+        await impatient.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned);
+
+        // The crawl the impatient caller started is still the one that answers the next caller.
+        var patient = service.GetSummaryAsync(CancellationToken.None);
+        _collector.Hold.SetResult();
+        var summary = await patient.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(summary);
+        Assert.Equal(1, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Caller_cancelled_while_waiting_does_not_disturb_the_collection_in_progress()
+    {
+        var service = CreateService();
+        using var impatient = new CancellationTokenSource();
+        _collector.Hold = new TaskCompletionSource();
+
+        var collecting = service.GetSummaryAsync(CancellationToken.None);
+        var waiting = service.GetSummaryAsync(impatient.Token);
+        await impatient.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
+
+        _collector.Hold.SetResult();
+        var summary = await collecting;
+        var afterwards = await service.GetSummaryAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Same(summary, afterwards);
+        Assert.Equal(1, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Concurrent_callers_share_one_failure_and_the_next_caller_tries_again()
+    {
+        var service = CreateService();
+        var failure = new InventoryUnavailableException(InventoryFailureReason.Timeout, "too slow");
+        _collector.Hold = new TaskCompletionSource();
+        _collector.Failure = failure;
+        _collector.OnlyCallThatFails = 1;
+
+        var first = service.GetSummaryAsync(CancellationToken.None);
+        var second = service.GetSummaryAsync(CancellationToken.None);
+        _collector.Hold.SetResult();
+
+        // One crawl, one failure, delivered to both: the second caller does not queue up a crawl of its own.
+        Assert.Same(failure, await Assert.ThrowsAsync<InventoryUnavailableException>(() => first));
+        Assert.Same(failure, await Assert.ThrowsAsync<InventoryUnavailableException>(() => second));
+        Assert.Equal(1, _collector.Calls);
+
+        Assert.NotNull(await service.GetSummaryAsync(CancellationToken.None));
+        Assert.Equal(2, _collector.Calls);
+    }
+
+    [Fact]
+    public async Task Crawl_that_exceeds_its_time_budget_is_a_timeout()
+    {
+        var service = CreateService(crawlTimeout: TimeSpan.FromMilliseconds(50));
+        _collector.Hold = new TaskCompletionSource();
+
+        var exception = await Assert.ThrowsAsync<InventoryUnavailableException>(
+            () => service.GetSummaryAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(InventoryFailureReason.Timeout, exception.Reason);
+    }
+
+    [Fact]
+    public async Task Application_shutdown_stops_the_crawl()
+    {
+        var service = CreateService();
+        _collector.Hold = new TaskCompletionSource();
+
+        var pending = service.GetSummaryAsync(CancellationToken.None);
+        await _lifetime.Stopping.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task Metadata_counts_are_zero_for_an_empty_dataset()
+    {
+        var summary = await CreateService().GetSummaryAsync(CancellationToken.None);
+
+        Assert.Empty(summary.Categories);
+        Assert.Equal(0, summary.Metadata.RecordsRetrieved);
+        Assert.Equal(0, summary.Metadata.ZeroQuantityExcluded);
+    }
+
+    private sealed class StubLifetime : IHostApplicationLifetime
+    {
+        public CancellationTokenSource Stopping { get; } = new();
+
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => Stopping.Token;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+
+        public void StopApplication() => Stopping.Cancel();
+    }
+
     private sealed class StubCollector : IInventoryCollector
     {
         public IReadOnlyList<InventoryRecord> Records { get; set; } = [];
         public Exception? Failure { get; set; }
+
+        /// <summary>When set, only this call (counting from 1) throws <see cref="Failure"/>.</summary>
+        public int? OnlyCallThatFails { get; set; }
+
         public TaskCompletionSource? Hold { get; set; }
-        public int Calls { get; private set; }
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
 
         public async Task<IReadOnlyList<InventoryRecord>> CollectAllAsync(CancellationToken cancellationToken)
         {
-            Calls++;
+            // Crawls run on the thread pool now, so count safely.
+            var call = Interlocked.Increment(ref _calls);
 
             if (Hold is not null)
             {
-                await Hold.Task;
+                // A crawl in progress ends early when its caller goes away, like the real one.
+                await Hold.Task.WaitAsync(cancellationToken);
             }
 
-            return Failure is null ? Records : throw Failure;
+            var fails = Failure is not null && (OnlyCallThatFails is null || OnlyCallThatFails == call);
+            return fails ? throw Failure! : Records;
         }
-    }
-
-    private sealed class ManualTimeProvider : TimeProvider
-    {
-        public DateTimeOffset Now { get; set; } = new(2026, 11, 22, 12, 0, 0, TimeSpan.Zero);
-
-        public override DateTimeOffset GetUtcNow() => Now;
     }
 }

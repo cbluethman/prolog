@@ -145,6 +145,21 @@ public class SummaryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Unexpected_exception_shows_no_stack_trace_in_development_either()
+    {
+        // "dotnet run" uses Development, where ASP.NET would otherwise add its developer exception page.
+        using var development = _factory.WithWebHostBuilder(host => host.UseEnvironment("Development"));
+        _upstream.Failure = new InvalidOperationException("secret internal detail");
+
+        var response = await development.CreateClient().GetAsync(InventoryEndpoints.SummaryRoute);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.DoesNotContain("secret internal detail", body);
+        Assert.DoesNotContain("   at ", body);
+    }
+
+    [Fact]
     public async Task Unexpected_exception_is_a_500_problem_without_a_stack_trace()
     {
         _upstream.Failure = new InvalidOperationException("secret internal detail");
@@ -156,5 +171,108 @@ public class SummaryEndpointTests : IDisposable
         Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
         Assert.DoesNotContain("secret internal detail", body);
         Assert.DoesNotContain("   at ", body);
+    }
+
+    [Theory]
+    [InlineData(InventoryFailureReason.Unreachable)]
+    [InlineData(InventoryFailureReason.RateLimited)]
+    public async Task Service_unavailable_suggests_a_default_retry_after_when_the_upstream_gave_none(InventoryFailureReason reason)
+    {
+        _upstream.Failure = new InventoryUnavailableException(reason, "try later");
+
+        var (response, _) = await GetSummaryAsync();
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal(TimeSpan.FromSeconds(30), response.Headers.RetryAfter?.Delta);
+    }
+
+    [Fact]
+    public async Task Fractional_upstream_retry_after_is_rounded_up_to_whole_seconds()
+    {
+        _upstream.Failure = new InventoryUnavailableException(
+            InventoryFailureReason.RateLimited, "throttled", retryAfter: TimeSpan.FromSeconds(7.2));
+
+        var (response, _) = await GetSummaryAsync();
+
+        // Rounding down would invite the caller back while the upstream is still throttling.
+        Assert.Equal(["8"], response.Headers.GetValues("Retry-After"));
+    }
+
+    [Theory]
+    [InlineData(InventoryFailureReason.Timeout)]
+    [InlineData(InventoryFailureReason.Unauthorized)]
+    [InlineData(InventoryFailureReason.UpstreamError)]
+    [InlineData(InventoryFailureReason.InvalidData)]
+    public async Task Failure_that_waiting_will_not_fix_carries_no_retry_after(InventoryFailureReason reason)
+    {
+        _upstream.Failure = new InventoryUnavailableException(reason, "what went wrong");
+
+        var (response, _) = await GetSummaryAsync();
+
+        Assert.False(response.Headers.Contains("Retry-After"));
+    }
+
+    [Fact]
+    public async Task Failed_request_is_not_remembered_once_the_upstream_recovers()
+    {
+        _upstream.WithPage(1, totalPages: 1, totalRecords: 1, Record(1));
+        _upstream.Failure = new InventoryUnavailableException(InventoryFailureReason.Unreachable, "down");
+        var (failed, _) = await GetSummaryAsync();
+
+        _upstream.Failure = null;
+        var (recovered, json) = await GetSummaryAsync();
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, failed.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+        Assert.Equal(1, json.GetProperty("categories").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task Empty_upstream_dataset_is_a_success_with_no_categories()
+    {
+        _upstream.WithPage(1, totalPages: 0, totalRecords: 0);
+
+        var (response, json) = await GetSummaryAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(0, json.GetProperty("categories").GetArrayLength());
+        Assert.Equal(0, json.GetProperty("metadata").GetProperty("recordsRetrieved").GetInt32());
+    }
+
+    [Fact]
+    public async Task Metadata_says_when_the_data_was_retrieved_in_utc()
+    {
+        _upstream.WithPage(1, totalPages: 1, totalRecords: 1, Record(1));
+        var before = DateTimeOffset.UtcNow;
+
+        var (_, json) = await GetSummaryAsync();
+
+        var raw = json.GetProperty("metadata").GetProperty("retrievedAtUtc").GetString();
+        Assert.EndsWith("Z", raw);
+        Assert.InRange(DateTimeOffset.Parse(raw!), before, DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task Unknown_route_is_a_404_problem_response()
+    {
+        var response = await _factory.CreateClient().GetAsync("/api/inventory/nothing-here");
+        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(404, json.GetProperty("status").GetInt32());
+        Assert.Empty(_upstream.RequestedPages);
+    }
+
+    [Fact]
+    public async Task Wrong_method_on_the_summary_route_is_a_405_problem_response()
+    {
+        var response = await _factory.CreateClient().PostAsync(InventoryEndpoints.SummaryRoute, content: null);
+        var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(405, json.GetProperty("status").GetInt32());
+        Assert.Empty(_upstream.RequestedPages);
     }
 }
