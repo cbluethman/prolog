@@ -29,9 +29,11 @@ public sealed class InventoryApiClient(IHttpClientFactory httpClientFactory) : I
         }
         catch (HttpRequestException exception)
         {
+            // The transport message can contain the upstream host name, which is private.
+            // It stays on the inner exception for the logs and out of the caller-facing message.
             throw new InventoryUnavailableException(
                 InventoryFailureReason.Unreachable,
-                $"Could not reach the Inventory API for page {page}: {exception.Message}",
+                $"Could not reach the Inventory API for page {page}.",
                 exception);
         }
         catch (Exception exception) when (
